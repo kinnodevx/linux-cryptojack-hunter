@@ -453,6 +453,38 @@ if has systemctl; then
   done
 fi
 
+# 5c) systemd unit whose ExecStart runs a raw script sitting directly under
+#     /etc/ (not the legitimate /etc/init.d/ SysV convention), where that
+#     script re-execs /usr/bin/systemd on an uncommented line. Seen once
+#     already disguised as "vimenv": the script was padded with several
+#     paragraphs of verbatim GNU Coding Standards text as comments, so a
+#     quick `cat` looks like nothing but boilerplate documentation, and the
+#     one real command hides easily in the middle. A legitimate package
+#     never installs its startup script as a bare file directly in /etc/.
+say "Checking for a systemd unit disguised as a padded boilerplate script..."
+if has systemctl; then
+  for unit_file in /etc/systemd/system/*.service; do
+    [ -f "$unit_file" ] || continue
+    target=$(grep -oE 'ExecStart=/etc/[^/[:space:]]+' "$unit_file" 2>/dev/null | head -1 | cut -d= -f2)
+    [ -n "$target" ] && [ -f "$target" ] || continue
+    # Strip full-line comments and blank lines before checking; the disguise
+    # relies on a wall of "# ..." text hiding one real command in the middle.
+    payload=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$target" 2>/dev/null)
+    if echo "$payload" | grep -qE '(^|[;&|[:space:]])/(usr/bin|bin)/systemd([[:space:]]|$)'; then
+      record "boilerplate-systemd-reexec" "confirmed" "$unit_file execs $target, which re-invokes systemd on an uncommented line: $(echo "$payload" | tr '\n' ';')"
+      if [ "$KILL" = 1 ]; then
+        unit_name=$(basename "$unit_file")
+        systemctl stop "$unit_name" 2>/dev/null
+        systemctl disable "$unit_name" 2>/dev/null
+        safe_remove "$unit_file"
+        safe_remove "$target"
+        systemctl daemon-reload 2>/dev/null
+        say "  stopped/disabled/removed: $unit_name and $target"
+      fi
+    fi
+  done
+fi
+
 # 6) Every user's crontab plus /etc/cron.d. The known dropper domain is
 #    often embedded as a base64 blob rather than plain text, so any
 #    long base64-looking substring gets decoded before the domain
