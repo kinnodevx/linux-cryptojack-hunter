@@ -1,0 +1,122 @@
+# linux-cryptojack-hunter
+
+A detection and cleanup script for a family of cryptojacking malware that kept reinfecting one of my servers over the course of two weeks. Each time it came back wearing a different disguise, but always with the same skeleton underneath. I documented the process because every reinfection taught me something new about how this kind of kit hides itself, and the script grew out of that.
+
+## How this started
+
+I noticed the first sign by accident. A task that normally took a couple of seconds started hanging, and `uptime` showed a load average that made no sense for a single-core VPS. `ps aux` turned up two processes eating more than 170% of CPU combined. One was called `dashboard`, running out of `/tmp` with a config file next to it (`v.json`). The other had a random 8 character name and no matching executable on disk at all (it had already deleted itself, but kept running from memory).
+
+The `v.json` matched an XMRig config on sight, a Monero miner pointed at a public pool. The random named process had an active network connection to an IP on a port that had nothing to do with any legitimate service. I killed both, cleaned up the files, and moved on.
+
+I thought that was the end of it. It wasn't.
+
+## The reinfection, and a deliberate choice
+
+Six hours later the same symptoms came back. High CPU, same kind of process, same behavioral family. That changes the question from "what is this" to "why does this keep coming back when I did nothing wrong in between".
+
+At this point I made a decision that shapes the rest of this writeup: I did not rotate the root password. Not because I overlooked it, but because I wanted to see how far this thing would go and how it would adapt between cleanups. Treating the box as a live observation target, rather than patching the hole immediately, is what let the rest of this story happen.
+
+The answer to "why does it keep coming back" showed up in layers, with each reinfection revealing a different persistence mechanism:
+
+* A crontab recreating an administrative user every 30 minutes.
+* A systemd service disguised as a "System Service Manager", which downloaded and re-executed a remote script.
+* A cron job named after a legitimate system task, hiding an entire payload encoded in base64.
+* And, more concerning: a hook in `/etc/ld.so.preload`, the classic way a userland rootkit intercepts system calls (`readdir`, specifically) to hide processes and files from anything that lists them. The library file predated my first cleanup by days, which changes the whole interpretation: these might not have been separate reinfections at all, but a single resident compromise quietly relaunching the visible payload every time I killed the previous one.
+
+## The most interesting find
+
+During a deeper investigation late one night, I found the most sophisticated watchdog mechanism yet: a systemd service with a generic name and a fake description of "Kernel Thread Daemon", running a loop that checked every 5 minutes whether a specific process existed, and if not, executed a hidden script (`.khp`, a dotfile tucked inside `/bin`) to relaunch everything.
+
+That relaunch script had five fallback download sources, tried in order until one worked. The first two were plain IPs. The next two were `.eth` domains, resolved through an IPFS gateway rather than a traditional domain registrar. This is a real technique called EtherHiding: hosting C2 infrastructure on a public blockchain, because there is no taking down a record that has already been written to an immutable, distributed ledger. Finding that on a five dollar a month VPS was the moment I realized this was not a bored teenager's script anymore. It is campaign tooling, and quite likely AI assisted to some degree. LLM generated malware went from about 2% of detected threats in 2021 to a projected 50% in 2025.
+
+```mermaid
+xychart-beta
+    title "Share of detected threats attributed to LLM-generated malware"
+    x-axis [2021, 2025]
+    y-axis "Percent of detected threats" 0 --> 100
+    bar [2, 50]
+```
+
+While investigating the entry vector, I found something else. The authentication logs showed no successful login at all during the window when the latest persistence mechanism was installed. For a moment I assumed the server had rebooted, but `uptime` proved otherwise. The systemd journal log for that exact minute read, literally, "Journal file has been deleted, rotating": someone with root access had deleted the log on purpose, and systemd simply recreated an empty one afterward. Active anti forensics, not a system event.
+
+## The script, and the two mistakes that almost made things worse
+
+The script started simple: a list of known indicators (IPs, domains, known filenames) and two actions, kill the processes and remove the files. It grew as each reinfection revealed a new pattern that needed generic detection instead of a static list, because the process or service name changes every single time.
+
+Twice, while adding a new check, I nearly caused real damage:
+
+1. A cron checking function had its return logic inverted. In shell, exit code 0 means success, not "nothing found". The bug made the script delete a file exactly when it was clean. I ran it in production without noticing and deleted two legitimate cron jobs (SSL certificate renewal and a filesystem check). I recovered them by extracting the original content straight from the cached `.deb` packages, no guessing involved.
+2. A check meant to detect processes masquerading as kernel threads (the malware uses names like `ksmd`, a real Linux kernel thread, to blend into a quick `ps aux`) used the wrong test to decide what counted as fake. It would have killed `kthreadd`, the process that spawns every kernel thread on the system. Running that version in kill mode would have taken down the entire kernel on the VPS.
+
+Both were caught because of a simple rule I adopted after the first scare: every change to the script runs in report only mode, in a real session, before it is ever allowed to delete anything. A broad heuristic (a generic text pattern, like "downloads and pipes into a shell") never authorizes automatic removal by itself. Only a specific, confirmed indicator (an exact domain, IP, or hash) does.
+
+## What the script does today
+
+Indicators live in `iocs.conf`, sourced at runtime, not hardcoded in the script. Tracking a different campaign, or extending this one, means editing that file (or pointing `--iocs` at your own copy), never the engine itself.
+
+Every finding is scored CONFIRMED or WARNING. CONFIRMED means a specific indicator matched (an exact domain, IP, username, file signature) and `--kill` is allowed to act on it. WARNING means a generic behavioral pattern matched that shows up in legitimate setups too, so it is only ever reported, never removed automatically.
+
+Checks:
+
+* High-CPU processes running from `/tmp` or `/var/tmp`.
+* Processes with the name of a real kernel thread but a non-empty `cmdline` (a real kernel thread never has command line arguments, the same test `ps` uses internally).
+* Running processes whose backing binary has since been deleted, when it originally lived somewhere suspicious (self-deletion after launch is a common way to leave nothing on disk to scan).
+* Hidden executable files in system binary directories (`/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`), where legitimate packages never install dotfiles.
+* Active network connections to any known C2 IP from this campaign, plus a broader, unconfirmed check for connections to common mining-pool ports.
+* A rootkit hook through a non-empty `/etc/ld.so.preload`.
+* Miner configs (XMRig signature) in temp directories.
+* Known backdoor usernames.
+* systemd services matching a disguised watchdog pattern by unit file content (a reference to a hidden dotfile, or a self-checking loop using `pgrep`/`pidof`), not by name, since the name changes every time.
+* Every user's crontab and `/etc/cron.d`, decoding any base64 payload before comparing it against known domains, since this campaign's dropper never appears in plain text.
+* Optionally (`--deep`), binaries in system directories not owned by any installed package, the same idea behind `debsums`/`rpm -Va`. Off by default because it is noticeably slower.
+
+Files that carry the immutable attribute (`chattr +i`, another trick to survive a cleanup) are unlocked before removal.
+
+`./check-infection.sh` only reports. `./check-infection.sh --kill` acts on anything CONFIRMED. `--json` emits findings as a JSON array for feeding into something else. `--log FILE` appends a plain-text report to a file.
+
+## Indicators of compromise
+
+C2 and mining IPs observed:
+```
+57.129.119.218   193.32.162.73   45.86.86.254
+51.81.211.221    47.86.46.179    34.70.205.211
+69.30.251.156     216.98.10.60
+```
+
+Dropper domains:
+```
+0x1x2x3.top
+c3pool.org
+kworker.eth.limo
+kworker.eth.link
+```
+
+XMRig wallet observed:
+```
+46t3NBUSK5bJBcf6zSvrViGBe1k7N7p2rG3PKT2vMYpHVLSXf4bt3kRfR43ToVH77FcMnvngBNRpFQH31LUxGdCLQSwT295
+```
+
+Process and binary names seen over time (all random or masqueraded, do not trust the name, trust the behavior): `dashboard`, `ksmd` (impostor), and random 8 to 9 character alphanumeric strings.
+
+## Why this matters beyond my case
+
+The root cause never changed across any of the reinfections: a reused password, password authentication enabled over SSH. Every layer of disguise got more sophisticated, from an obvious backdoor user to a watchdog with a blockchain fallback, but the door it walked through was always the same trivial one. This is not a campaign targeting this server specifically. It is mass scanning of the internet, blind to whatever runs on each machine, aimed only at the lowest common denominator of any misconfigured box.
+
+If you ended up here because you found a strange process eating CPU on your own server, there is a decent chance it is the same family. Run the script, and if you find something it does not cover yet, a PR is welcome.
+
+## Usage
+
+```bash
+chmod +x check-infection.sh
+./check-infection.sh              # report only, safe, changes nothing
+./check-infection.sh --kill       # acts on anything CONFIRMED
+./check-infection.sh --deep       # also checks for unowned binaries (slower)
+./check-infection.sh --json       # machine-readable output
+./check-infection.sh --log out.txt --iocs my-campaign.conf
+```
+
+I strongly recommend always running report mode first, including after any change to the script or to `iocs.conf`.
+
+## License
+
+MIT.
