@@ -232,7 +232,7 @@ done
 say "Checking for processes matching the self-relaunch loader pattern..."
 for d in /proc/[0-9]*; do
   pid=$(basename "$d")
-  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
   [ -z "$cmd" ] && continue
   case "$cmd" in
     *"/bin/sh /bin/"*|*"/bin/dash /bin/"*|*"/bin/bash /bin/"*)
