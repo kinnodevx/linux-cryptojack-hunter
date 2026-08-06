@@ -77,6 +77,8 @@ fi
 source "$IOC_FILE"
 
 FOUND=0
+CONFIRMED_COUNT=0
+WARNING_COUNT=0
 FINDINGS_JSON=()
 LOG_LINES=()
 
@@ -100,8 +102,10 @@ record() {
   local check="$1" severity="$2" detail="$3"
   FOUND=1
   if [ "$severity" = "confirmed" ]; then
+    CONFIRMED_COUNT=$((CONFIRMED_COUNT + 1))
     say "CONFIRMED [$check]: $detail"
   else
+    WARNING_COUNT=$((WARNING_COUNT + 1))
     say "WARNING [$check]: $detail (generic pattern, not auto-removed, review manually)"
   fi
   FINDINGS_JSON+=("{\"check\":\"$(json_escape "$check")\",\"severity\":\"$severity\",\"detail\":\"$(json_escape "$detail")\"}")
@@ -199,6 +203,68 @@ for dir in /bin /usr/bin /sbin /usr/sbin; do
     [ "$KILL" = 1 ] && safe_remove "$f" && say "  removed: $f"
   done
 done
+
+# 1e) /tmp or /var/tmp carrying the immutable or append-only attribute. A
+#     normal system never sets either on these directories (constant
+#     create/delete traffic would break instantly); a static campaign
+#     scanning /tmp for miners has been seen chattr +i'ing it instead, which
+#     as a side effect breaks anything that needs a scratch dir there
+#     (including apt/dpkg, which is how this was first noticed). Safe to fix
+#     automatically: removing a spurious lock here only restores normal
+#     behavior, it cannot make a clean system worse.
+say "Checking /tmp and /var/tmp for a spurious immutable/append lock..."
+if has lsattr; then
+  for dir in /tmp /var/tmp; do
+    [ -d "$dir" ] || continue
+    flags=$(lsattr -d "$dir" 2>/dev/null | awk '{print $1}')
+    case "$flags" in
+      *i*|*a*)
+        record "tmp-locked" "confirmed" "$dir has attributes '$flags' set (immutable/append-only), not normal for a scratch directory"
+        if [ "$KILL" = 1 ] && has chattr; then
+          chattr -i -a "$dir" 2>/dev/null && say "  cleared attributes on $dir"
+        fi
+        ;;
+    esac
+  done
+else
+  say "  skipped (lsattr not available)"
+fi
+
+# 1f) chattr missing while lsattr is present: e2fsprogs ships both in the
+#     same package, so this asymmetry does not happen by normal wear. Seen
+#     once already: chattr specifically deleted, which blocks a defender
+#     (or a future run of this script with --kill) from locking files back
+#     down after cleanup. WARNING only, the safe fix is `apt-get
+#     install --reinstall e2fsprogs`, not something to automate blindly
+#     inside a security script.
+say "Checking for a selectively removed chattr binary..."
+if has lsattr && ! has chattr; then
+  record "chattr-removed" "warning" "lsattr is present but chattr is missing (e2fsprogs ships both); reinstall e2fsprogs to restore it"
+fi
+
+# 1g) Immutable attribute on a logging/audit binary. Seen once already on
+#     rsyslogd: locking the binary itself does not touch a single log line,
+#     but it silently breaks the daemon the next time a routine package
+#     update tries to replace it (dpkg cannot even take its usual backup
+#     link), and a dead rsyslogd means every log source that only goes
+#     through it (auth.log, syslog) goes dark while nothing on the surface
+#     looks tampered with. None of these binaries has any legitimate reason
+#     to be immutable. Safe to clear automatically, the same as 1e.
+say "Checking logging/audit binaries for a spurious immutable lock..."
+if has lsattr; then
+  for bin in /usr/sbin/rsyslogd /usr/sbin/auditd /usr/bin/journalctl /usr/lib/systemd/systemd-journald; do
+    [ -e "$bin" ] || continue
+    flags=$(lsattr "$bin" 2>/dev/null | awk '{print $1}')
+    case "$flags" in
+      *i*)
+        record "logging-binary-locked" "confirmed" "$bin has the immutable attribute set ('$flags'), which blocks its own future updates and can leave it dead after the next upgrade"
+        [ "$KILL" = 1 ] && has chattr && chattr -i "$bin" 2>/dev/null && say "  cleared immutable attribute on $bin"
+        ;;
+    esac
+  done
+else
+  say "  skipped (lsattr not available)"
+fi
 
 # 2) Network connections to a known C2 IP.
 say "Checking network connections to known C2 IPs..."
@@ -393,9 +459,11 @@ if [ "$DEEP" = 1 ]; then
 fi
 
 say "=== end of check ==="
-if [ "$FOUND" = 1 ]; then
-  say "RESULT: found sign(s) of infection."
+if [ "$CONFIRMED_COUNT" -gt 0 ]; then
+  say "RESULT: $CONFIRMED_COUNT confirmed infection indicator(s) found."
   [ "$KILL" = 1 ] || say "(ran in report mode, repeat with --kill to act on CONFIRMED findings)"
+elif [ "$WARNING_COUNT" -gt 0 ]; then
+  say "RESULT: nothing confirmed, $WARNING_COUNT generic warning(s) for manual review."
 else
   say "RESULT: nothing found."
 fi
@@ -413,5 +481,9 @@ if [ -n "$LOG_FILE" ]; then
   printf '%s\n' "${LOG_LINES[@]}" >> "$LOG_FILE"
 fi
 
-[ "$FOUND" = 1 ] && exit 1
+# Exit 1 only for CONFIRMED findings, so a cron/monitoring wrapper can alert
+# on real infection signal without paging on WARNING-only noise (a unit file
+# newer than /etc/hostname, a fetch-and-pipe pattern in a legitimate deploy
+# script, etc).
+[ "$CONFIRMED_COUNT" -gt 0 ] && exit 1
 exit 0

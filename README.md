@@ -54,7 +54,7 @@ Both were caught because of a simple rule I adopted after the first scare: every
 
 Indicators live in `iocs.conf`, sourced at runtime, not hardcoded in the script. Tracking a different campaign, or extending this one, means editing that file (or pointing `--iocs` at your own copy), never the engine itself.
 
-Every finding is scored CONFIRMED or WARNING. CONFIRMED means a specific indicator matched (an exact domain, IP, username, file signature) and `--kill` is allowed to act on it. WARNING means a generic behavioral pattern matched that shows up in legitimate setups too, so it is only ever reported, never removed automatically.
+Every finding is scored CONFIRMED or WARNING. CONFIRMED means a specific indicator matched (an exact domain, IP, username, file signature) and `--kill` is allowed to act on it; it is also the only thing that makes the script exit non-zero, so a cron wrapper can alert on real signal without paging on WARNING-only noise. WARNING means a generic behavioral pattern matched that shows up in legitimate setups too, so it is only ever reported, never removed automatically.
 
 Checks:
 
@@ -62,6 +62,9 @@ Checks:
 * Processes with the name of a real kernel thread but a non-empty `cmdline` (a real kernel thread never has command line arguments, the same test `ps` uses internally).
 * Running processes whose backing binary has since been deleted, when it originally lived somewhere suspicious (self-deletion after launch is a common way to leave nothing on disk to scan).
 * Hidden executable files in system binary directories (`/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`), where legitimate packages never install dotfiles.
+* `/tmp` or `/var/tmp` carrying the immutable or append-only attribute. Neither is ever legitimate on a scratch directory; one incident behind this repo used it to break defensive tooling (including the system's own package manager) as a side effect.
+* A logging or audit binary (`rsyslogd`, `auditd`, `journalctl`, `systemd-journald`) carrying the immutable attribute. It does not touch a single log line by itself, but it silently kills the daemon the next time a routine package update tries to replace it, and a dead syslog daemon means an entire log source goes dark with nothing on the surface looking tampered with.
+* `chattr` missing while `lsattr` is still present. The two ship in the same package, so this asymmetry does not happen by normal wear, only by someone specifically removing the one tool a defender would need to lock files back down.
 * Active network connections to any known C2 IP from this campaign, plus a broader, unconfirmed check for connections to common mining-pool ports.
 * A rootkit hook through a non-empty `/etc/ld.so.preload`.
 * Miner configs (XMRig signature) in temp directories.
