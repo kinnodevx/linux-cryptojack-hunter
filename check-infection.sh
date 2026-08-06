@@ -204,6 +204,45 @@ for dir in /bin /usr/bin /sbin /usr/sbin; do
   done
 done
 
+# 1d-ii) Loader with a known filename that does NOT use the dotfile
+#     convention. Seen once already: /bin/idle, deliberately named to look
+#     boring rather than hidden, so 1d above never catches it.
+say "Checking for known loader filenames in system binary directories..."
+for dir in /bin /usr/bin /sbin /usr/sbin; do
+  for name in "${KNOWN_LOADER_FILES[@]}"; do
+    f="$dir/$name"
+    [ -f "$f" ] || continue
+    record "known-loader-file" "confirmed" "$f"
+    [ "$KILL" = 1 ] && safe_remove "$f" && say "  removed: $f"
+  done
+done
+
+# 1d-iii) Running process matching the self-relaunch invocation signature:
+#     /bin/sh /bin/<X> <name> /bin/<name>, where a loader calls itself with
+#     the target process name repeated as an argument. Generic by design
+#     (does not depend on the loader's filename), to survive the next
+#     rename. A legitimate script essentially never invokes itself this way.
+#
+#     Reads /proc/PID/cmdline directly instead of piping through `ps -e`:
+#     caught live on 173.199.92.19 missing a process that /proc itself
+#     could see fine (stat/cat on /proc/PID/status worked, ps -e simply
+#     never printed it) — cause not confirmed (not the ld.so.preload
+#     rootkit, that file was absent), but /proc is the ground truth ps is
+#     built on, so read it directly rather than trust ps not to drop a row.
+say "Checking for processes matching the self-relaunch loader pattern..."
+for d in /proc/[0-9]*; do
+  pid=$(basename "$d")
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  [ -z "$cmd" ] && continue
+  case "$cmd" in
+    *"/bin/sh /bin/"*|*"/bin/dash /bin/"*|*"/bin/bash /bin/"*)
+      echo "$cmd" | grep -qE '/bin/(sh|dash|bash) /(bin|usr/bin|sbin|usr/sbin)/[^ ]+ [^ ]+ /(bin|usr/bin|sbin|usr/sbin)/[^ ]+' || continue
+      record "self-relaunch-loader" "confirmed" "pid=$pid cmd=$cmd"
+      [ "$KILL" = 1 ] && kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+      ;;
+  esac
+done
+
 # 1e) chattr missing while lsattr is present: e2fsprogs ships both in the
 #     same package, so this asymmetry does not happen by normal wear. Seen
 #     repeatedly: chattr specifically deleted, which blocks a defender (or
