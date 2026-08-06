@@ -204,7 +204,33 @@ for dir in /bin /usr/bin /sbin /usr/sbin; do
   done
 done
 
-# 1e) /tmp or /var/tmp carrying the immutable or append-only attribute. A
+# 1e) chattr missing while lsattr is present: e2fsprogs ships both in the
+#     same package, so this asymmetry does not happen by normal wear. Seen
+#     repeatedly: chattr specifically deleted, which blocks a defender (or
+#     this script's own --kill) from locking files back down after cleanup,
+#     and from clearing the spurious /tmp lock in 1f below. Runs before 1f
+#     for exactly that reason. Reinstalling e2fsprogs only replaces a
+#     binary that is either missing or byte-identical to the package's, so
+#     it is safe to do automatically under --kill, unlike most package
+#     operations this script would otherwise only ever recommend.
+say "Checking for a selectively removed chattr binary..."
+if has lsattr && ! has chattr; then
+  record "chattr-removed" "confirmed" "lsattr is present but chattr is missing (e2fsprogs ships both)"
+  if [ "$KILL" = 1 ] && has apt-get; then
+    say "  attempting to restore it: apt-get install --reinstall e2fsprogs"
+    # /tmp itself may be locked (see 1f) and break apt's own scratch space;
+    # route around it with a TMPDIR apt is still allowed to write to.
+    mkdir -p /root/.cryptojack-hunter-tmp 2>/dev/null
+    if TMPDIR=/root/.cryptojack-hunter-tmp DEBIAN_FRONTEND=noninteractive \
+       apt-get install --reinstall -y e2fsprogs >/dev/null 2>&1 && has chattr; then
+      say "  chattr restored"
+    else
+      say "  could not restore chattr automatically, reinstall e2fsprogs by hand"
+    fi
+  fi
+fi
+
+# 1f) /tmp or /var/tmp carrying the immutable or append-only attribute. A
 #     normal system never sets either on these directories (constant
 #     create/delete traffic would break instantly); a static campaign
 #     scanning /tmp for miners has been seen chattr +i'ing it instead, which
@@ -230,18 +256,6 @@ else
   say "  skipped (lsattr not available)"
 fi
 
-# 1f) chattr missing while lsattr is present: e2fsprogs ships both in the
-#     same package, so this asymmetry does not happen by normal wear. Seen
-#     once already: chattr specifically deleted, which blocks a defender
-#     (or a future run of this script with --kill) from locking files back
-#     down after cleanup. WARNING only, the safe fix is `apt-get
-#     install --reinstall e2fsprogs`, not something to automate blindly
-#     inside a security script.
-say "Checking for a selectively removed chattr binary..."
-if has lsattr && ! has chattr; then
-  record "chattr-removed" "warning" "lsattr is present but chattr is missing (e2fsprogs ships both); reinstall e2fsprogs to restore it"
-fi
-
 # 1g) Immutable attribute on a logging/audit binary. Seen once already on
 #     rsyslogd: locking the binary itself does not touch a single log line,
 #     but it silently breaks the daemon the next time a routine package
@@ -249,7 +263,7 @@ fi
 #     link), and a dead rsyslogd means every log source that only goes
 #     through it (auth.log, syslog) goes dark while nothing on the surface
 #     looks tampered with. None of these binaries has any legitimate reason
-#     to be immutable. Safe to clear automatically, the same as 1e.
+#     to be immutable. Safe to clear automatically, the same as 1f.
 say "Checking logging/audit binaries for a spurious immutable lock..."
 if has lsattr; then
   for bin in /usr/sbin/rsyslogd /usr/sbin/auditd /usr/bin/journalctl /usr/lib/systemd/systemd-journald; do

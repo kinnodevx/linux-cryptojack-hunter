@@ -64,7 +64,7 @@ Checks:
 * Hidden executable files in system binary directories (`/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`), where legitimate packages never install dotfiles.
 * `/tmp` or `/var/tmp` carrying the immutable or append-only attribute. Neither is ever legitimate on a scratch directory; one incident behind this repo used it to break defensive tooling (including the system's own package manager) as a side effect.
 * A logging or audit binary (`rsyslogd`, `auditd`, `journalctl`, `systemd-journald`) carrying the immutable attribute. It does not touch a single log line by itself, but it silently kills the daemon the next time a routine package update tries to replace it, and a dead syslog daemon means an entire log source goes dark with nothing on the surface looking tampered with.
-* `chattr` missing while `lsattr` is still present. The two ship in the same package, so this asymmetry does not happen by normal wear, only by someone specifically removing the one tool a defender would need to lock files back down.
+* `chattr` missing while `lsattr` is still present. The two ship in the same package, so this asymmetry does not happen by normal wear, only by someone specifically removing the one tool a defender would need to lock files back down. `--kill` reinstalls the package automatically (routing around a locked `/tmp` if needed) before the `/tmp`/`/var/tmp` check below runs, so one pass fixes both instead of requiring a manual reinstall in between.
 * Active network connections to any known C2 IP from this campaign, plus a broader, unconfirmed check for connections to common mining-pool ports.
 * A rootkit hook through a non-empty `/etc/ld.so.preload`.
 * Miner configs (XMRig signature) in temp directories.
