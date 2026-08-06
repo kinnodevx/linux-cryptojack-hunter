@@ -75,6 +75,7 @@ if [ ! -f "$IOC_FILE" ]; then
 fi
 # shellcheck source=iocs.conf
 source "$IOC_FILE"
+EXTRA_SCAN_DIRS=("${EXTRA_SCAN_DIRS[@]:-}")
 
 FOUND=0
 CONFIRMED_COUNT=0
@@ -194,9 +195,18 @@ else
 fi
 
 # 1d) Hidden executable file (dotfile) in a system binary directory. No
-#     legitimate package installs a dotfile there.
+#     legitimate package installs a dotfile there. Deliberately NOT
+#     extended to EXTRA_SCAN_DIRS: a web app root has legitimate dotfiles
+#     everywhere (.env, .gitignore, .env.example, node_modules/.package-
+#     lock.json), so "any dotfile is confirmed malware" is true for a
+#     system bin dir and flatly false for an app root. Learned this one
+#     expensively: an earlier version of this exact check ran against
+#     EXTRA_SCAN_DIRS and --kill deleted five different apps' .env files
+#     in one pass. Web app roots are covered by 1d-ii below instead, which
+#     only matches a specific known filename, never "any dotfile".
 say "Checking for hidden files in system binary directories..."
 for dir in /bin /usr/bin /sbin /usr/sbin; do
+  [ -d "$dir" ] || continue
   for f in "$dir"/.[!.]*; do
     [ -f "$f" ] || continue
     record "hidden-binary" "confirmed" "$f"
@@ -206,9 +216,11 @@ done
 
 # 1d-ii) Loader with a known filename that does NOT use the dotfile
 #     convention. Seen once already: /bin/idle, deliberately named to look
-#     boring rather than hidden, so 1d above never catches it.
-say "Checking for known loader filenames in system binary directories..."
-for dir in /bin /usr/bin /sbin /usr/sbin; do
+#     boring rather than hidden, so 1d above never catches it. Also checks
+#     EXTRA_SCAN_DIRS for the same reason as above.
+say "Checking for known loader filenames in system binary directories and web app roots..."
+for dir in /bin /usr/bin /sbin /usr/sbin ${EXTRA_SCAN_DIRS[@]:-}; do
+  [ -d "$dir" ] || continue
   for name in "${KNOWN_LOADER_FILES[@]}"; do
     f="$dir/$name"
     [ -f "$f" ] || continue
