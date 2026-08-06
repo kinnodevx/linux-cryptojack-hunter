@@ -398,20 +398,30 @@ fi
 say "Checking crontabs and /etc/cron.d..."
 check_cron_content() {
   local label="$1" content="$2"
-  local domain_hit=0 heuristic_hit=0
+  local domain_hit=0 heuristic_hit=0 watchdog_hit=0
   local decoded combined
   decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
     echo "$b64" | base64 -d 2>/dev/null
   done)
   combined="$content
 $decoded"
-  for d in "${DROPPER_DOMAINS[@]}"; do
+  for d in "${DROPPER_DOMAINS[@]}" "${C2_IPS[@]}"; do
     echo "$combined" | grep -qF "$d" && domain_hit=1
   done
+  # Self-healing watchdog disguised as a cron entry instead of a systemd
+  # unit: probes its own liveness (kill -0 <pid>, pgrep, pidof, or a specific
+  # /proc/net/tcp connection) and only fetches+executes a remote payload when
+  # that check fails. A legitimate cron job essentially never combines a
+  # liveness probe with a curl/wget-to-shell fallback in the same line, so
+  # this is specific enough to treat as CONFIRMED, same as the systemd
+  # watchdog-unit check.
+  echo "$combined" | grep -qE '(kill -0|pgrep|pidof).*(curl|wget)[^|]*\|\s*(/bin/)?sh\b' && watchdog_hit=1
   echo "$combined" | grep -qE 'base64 -d \| */bin/sh|curl[^|]*\| *(/bin/)?sh\b|wget[^|]*\| *(/bin/)?sh\b' && heuristic_hit=1
 
-  if [ "$domain_hit" = 1 ]; then
-    record "cron-dropper" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
+  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ]; then
+    local check="cron-dropper"
+    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && check="cron-watchdog"
+    record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
     return 0
   fi
   if [ "$heuristic_hit" = 1 ]; then
@@ -422,7 +432,9 @@ $decoded"
 if has crontab; then
   for u in $(cut -f1 -d: /etc/passwd); do
     c=$(crontab -u "$u" -l 2>/dev/null) || continue
-    [ -n "$c" ] && check_cron_content "crontab of $u" "$c"
+    if [ -n "$c" ] && check_cron_content "crontab of $u" "$c"; then
+      [ "$KILL" = 1 ] && crontab -u "$u" -r 2>/dev/null && say "  cleared crontab: $u"
+    fi
   done
 fi
 for f in /etc/cron.d/*; do

@@ -70,7 +70,7 @@ Checks:
 * Miner configs (XMRig signature) in temp directories.
 * Known backdoor usernames.
 * systemd services matching a disguised watchdog pattern by unit file content (a reference to a hidden dotfile, or a self-checking loop using `pgrep`/`pidof`), not by name, since the name changes every time.
-* Every user's crontab and `/etc/cron.d`, decoding any base64 payload before comparing it against known domains, since this campaign's dropper never appears in plain text.
+* Every user's crontab and `/etc/cron.d`, decoding any base64 payload before comparing it against known domains and C2 IPs, since this campaign's dropper does not always appear in plain text. Also matches a self-healing watchdog disguised as a cron entry instead of a systemd unit: a liveness probe (`kill -0`, `pgrep`, `pidof`, or a specific `/proc/net/tcp` connection) combined with a curl/wget-to-shell fallback in the same line. A confirmed match clears the whole crontab, the same way a confirmed `/etc/cron.d` file gets deleted outright.
 * Optionally (`--deep`), binaries in system directories not owned by any installed package, the same idea behind `debsums`/`rpm -Va`. Off by default because it is noticeably slower.
 
 Files that carry the immutable attribute (`chattr +i`, another trick to survive a cleanup) are unlocked before removal.
