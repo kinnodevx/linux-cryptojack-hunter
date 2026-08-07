@@ -495,7 +495,7 @@ fi
 say "Checking crontabs and /etc/cron.d..."
 check_cron_content() {
   local label="$1" content="$2"
-  local domain_hit=0 heuristic_hit=0 watchdog_hit=0
+  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0
   local decoded combined
   decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
     echo "$b64" | base64 -d 2>/dev/null
@@ -514,10 +514,23 @@ $decoded"
   # watchdog-unit check.
   echo "$combined" | grep -qE '(kill -0|pgrep|pidof).*(curl|wget)[^|]*\|\s*(/bin/)?sh\b' && watchdog_hit=1
   echo "$combined" | grep -qE 'base64 -d \| */bin/sh|curl[^|]*\| *(/bin/)?sh\b|wget[^|]*\| *(/bin/)?sh\b' && heuristic_hit=1
+  # @reboot persistence for a KNOWN loader binary: no domain/IP and no
+  # fetch-and-pipe in the cron line itself, since the payload is already
+  # sitting on disk (usually /var/tmp) and cron just launches it by exact
+  # filename after every reboot. This survives a plain process-kill because
+  # the process check only sees it while it is running; found live on oddify
+  # 2026-08-07 as a triplicated "@reboot cd /var/tmp && nohup ./cpu-logind
+  # -c config.json" entry that kept respawning the miner across reboots.
+  # Matching on an exact KNOWN_LOADER_FILES name (not a generic word) keeps
+  # this CONFIRMED-safe instead of a heuristic.
+  for name in "${KNOWN_LOADER_FILES[@]}"; do
+    echo "$combined" | grep -qE "(^|[/[:space:]])${name}([[:space:]]|\$)" && loader_hit=1
+  done
 
-  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ]; then
+  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ]; then
     local check="cron-dropper"
-    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && check="cron-watchdog"
+    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && check="cron-watchdog"
+    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && check="cron-loader-persistence"
     record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
     return 0
   fi
