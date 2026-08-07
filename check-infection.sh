@@ -217,9 +217,16 @@ done
 # 1d-ii) Loader with a known filename that does NOT use the dotfile
 #     convention. Seen once already: /bin/idle, deliberately named to look
 #     boring rather than hidden, so 1d above never catches it. Also checks
-#     EXTRA_SCAN_DIRS for the same reason as above.
-say "Checking for known loader filenames in system binary directories and web app roots..."
-for dir in /bin /usr/bin /sbin /usr/sbin ${EXTRA_SCAN_DIRS[@]:-}; do
+#     EXTRA_SCAN_DIRS for the same reason as above, and /tmp + /var/tmp:
+#     found live on oddify 2026-08-07 that killing the process, removing
+#     config.json, and clearing the @reboot crontab all still left
+#     /var/tmp/cpu-logind itself sitting on disk untouched (the process,
+#     config, and cron checks never look at the loader binary's own file),
+#     so nothing had to be re-downloaded for the next reinfection to relaunch
+#     it — closing the loop means removing the binary too, not just what
+#     launches or configures it.
+say "Checking for known loader filenames in system binary directories, web app roots, and /tmp/var-tmp..."
+for dir in /bin /usr/bin /sbin /usr/sbin /tmp /var/tmp ${EXTRA_SCAN_DIRS[@]:-}; do
   [ -d "$dir" ] || continue
   for name in "${KNOWN_LOADER_FILES[@]}"; do
     f="$dir/$name"
