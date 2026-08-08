@@ -125,7 +125,16 @@ safe_remove() {
 
 say "=== linux-cryptojack-hunter v$VERSION - $(hostname) - $(date) ==="
 
-# 1) High-CPU process running from /tmp or /var/tmp.
+# 1) High-CPU process running from /tmp or /var/tmp. The attacker renames
+#    this binary every time (cpu-logind, dashboard, and whatever comes
+#    next), specifically to dodge exact-name matching like
+#    KNOWN_LOADER_FILES. A high-CPU process whose own backing binary lives
+#    in /tmp or /var/tmp is confirmed malicious regardless of what it is
+#    named, so --kill now also removes that exact backing file, not just
+#    the process. Before this, killing the process left the binary itself
+#    on disk under --kill (seen live on oddify: cpu-logind survived one
+#    remediation pass this way, then again hours later as /tmp/dashboard,
+#    same 8350992-byte binary, new name, still not deleted by any check).
 say "Checking for high-CPU processes running from /tmp or /var/tmp..."
 if has ps && has awk; then
   while read -r pid cpu comm; do
@@ -134,7 +143,10 @@ if has ps && has awk; then
     case "$exe" in
       /tmp/*|/var/tmp/*)
         record "tmp-exec" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
-        [ "$KILL" = 1 ] && kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+        if [ "$KILL" = 1 ]; then
+          kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+          [ -n "$exe" ] && [ -f "$exe" ] && safe_remove "$exe" && say "  removed: $exe"
+        fi
         ;;
     esac
   done < <(ps -e -o pid=,%cpu=,comm= | awk -v t="$CPU_THRESHOLD" '$2+0 > t {print $1, $2, $3}')
