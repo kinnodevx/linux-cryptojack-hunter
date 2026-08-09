@@ -148,6 +148,30 @@ if has ps && has awk; then
           [ -n "$exe" ] && [ -f "$exe" ] && safe_remove "$exe" && say "  removed: $exe"
         fi
         ;;
+      /usr/share/man/*|/usr/share/doc/*|/usr/share/info/*|/usr/share/locale/*|/usr/share/mime/*)
+        # 1a-ii) High-CPU process backed by a binary sitting inside a
+        # pure-documentation/package-metadata directory. Nothing legitimate
+        # ever puts an executable in man/doc/info/locale/mime data — package
+        # managers only ever write text/data files there — so this is as
+        # safe to trust as /tmp or /var/tmp, no name-based heuristic needed.
+        #
+        # Found live on oddify: journald-7a35f733 (mimicking systemd-journald
+        # by name — not a real kernel thread, so the fake-kernel-thread check
+        # below doesn't apply) running from a hidden directory under
+        # /usr/share/man/man3/, a location no existing check ever looked at.
+        #
+        # Deliberately NOT generalized to "any hidden directory anywhere":
+        # tested that first and it killed live Claude Code processes running
+        # from ~/.local/share/claude/... — .local/.config/.cache/.npm/.cargo
+        # etc. are completely normal per-user install locations. Scoping to
+        # specific directories that can never legitimately hold an
+        # executable is the safe version of the same idea.
+        record "doc-dir-exec" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+        if [ "$KILL" = 1 ]; then
+          kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+          [ -f "$exe" ] && safe_remove "$exe" && say "  removed: $exe"
+        fi
+        ;;
     esac
   done < <(ps -e -o pid=,%cpu=,comm= | awk -v t="$CPU_THRESHOLD" '$2+0 > t {print $1, $2, $3}')
 else
