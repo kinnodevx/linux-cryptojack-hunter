@@ -426,6 +426,50 @@ if [ -s /etc/ld.so.preload ]; then
   fi
 fi
 
+# 2d) Core system utility (ps, top, ...) replaced by a filtering wrapper
+#     script instead of the real compiled binary. A different, older-style
+#     userland rootkit hook than ld.so.preload: instead of intercepting
+#     readdir, it renames the real binary to <name>.original and drops a
+#     shell script in its place that calls the original and pipes the
+#     output through `grep -v <hidden-name>` to hide a specific process from
+#     anyone running ps/top by hand — or from this very script, since every
+#     CPU-based check above depends on `ps -e`.
+#
+#     Found live on oddify: /usr/bin/ps and /usr/bin/top both replaced this
+#     way (dpkg -V flags both, confirmed against the real procps package),
+#     filtering out a process named "javab" — the same name seen before as
+#     a disguised systemd unit in this campaign's history. ps.original was
+#     already missing by the time this was found, so the wrapper was 100%
+#     broken (ps returned nothing at all instead of hiding just one
+#     process) — meaning every ps-dependent check in this script had been
+#     silently blind on this host the whole time, and the only reason
+#     cpu-logind/dashboard/etc. kept getting caught anyway is that
+#     known-loader-file, c2-connection and miner-config never relied on ps.
+#
+#     No legitimate ps/top install is ever a shell script that shells out to
+#     a `.original`-suffixed sibling and filters its own output — that
+#     combination is unambiguous, so this is CONFIRMED and safe to fix by
+#     reinstalling the owning package (same pattern already used for a
+#     locked/deleted chattr or rsyslogd).
+say "Checking core utilities for a hidden-process filtering wrapper..."
+for bin in "${WRAPPED_BIN_CANDIDATES[@]}"; do
+  path=$(command -v "$bin" 2>/dev/null)
+  [ -n "$path" ] && [ -f "$path" ] || continue
+  head -c 64 "$path" 2>/dev/null | grep -q '^#!' || continue
+  content=$(cat "$path" 2>/dev/null)
+  if echo "$content" | grep -qE '\.original\b.*\|[[:space:]]*grep[[:space:]]+-v'; then
+    record "utility-hijacked" "confirmed" "$path is a wrapper hiding output from the real binary: $(echo "$content" | tr '\n' ';')"
+    if [ "$KILL" = 1 ]; then
+      pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1 | head -1)
+      if [ -n "$pkg" ]; then
+        apt-get install --reinstall -y "$pkg" >/dev/null 2>&1 && say "  reinstalled package '$pkg' to restore $path"
+      else
+        say "  could not determine the owning package for $path — not auto-fixed, reinstall it manually"
+      fi
+    fi
+  fi
+done
+
 # 3) Miner config signature (v.json-style XMRig config) in a temp dir.
 say "Checking for miner config files in /tmp and /var/tmp..."
 for f in /tmp/*.json /var/tmp/*.json; do
