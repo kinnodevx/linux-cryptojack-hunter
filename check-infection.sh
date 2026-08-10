@@ -144,7 +144,17 @@ capture_forensics() {
       if [ -r "/proc/$p/stat" ]; then
         comm=$(cat "/proc/$p/comm" 2>/dev/null)
         exe=$(readlink "/proc/$p/exe" 2>/dev/null)
-        ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+        # /proc/PID/stat is "pid (comm) state ppid ...", and comm can itself
+        # contain spaces or parens (this campaign's own "redis-server re"
+        # disguise does exactly that) — a naive `awk '{print $4}'` silently
+        # picks up a field of the comm text instead of the real ppid the
+        # moment that happens. The format guarantees comm is bounded by the
+        # FIRST '(' and the LAST ')' on the line, so strip up through that
+        # last ')' before splitting on whitespace; caught live when this
+        # exact process ("redis-server re") produced ppid=S instead of a
+        # number, breaking ancestry capture on the one campaign this
+        # forensics feature was built to trace.
+        ppid=$(sed -E 's/^[0-9]+ \(.*\) //' "/proc/$p/stat" 2>/dev/null | awk '{print $2}')
         cmdline=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
         echo "  pid=$p ppid=$ppid comm=$comm exe=${exe:-?} cmdline=${cmdline:-?}"
         p="$ppid"
