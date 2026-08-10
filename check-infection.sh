@@ -505,6 +505,15 @@ if has systemctl; then
         systemctl stop "$name.service" "$name.timer" 2>/dev/null
         systemctl disable "$name.service" "$name.timer" 2>/dev/null
         find /etc/systemd/system -iname "${name}*" -delete 2>/dev/null
+        # Without this, systemd keeps the unit "Loaded" from its in-memory
+        # cache even after the file is gone, so `list-units --all` (what the
+        # check above greps) keeps matching it on the next run — a clean
+        # remediation reported back as still-CONFIRMED. Caught live on
+        # apostacertabet: redis-sentinel kept showing up after stop+disable+
+        # delete until a manual `daemon-reload` made it disappear. The other
+        # two systemd-unit checks below already had this line; this one just
+        # never got it when it was written first.
+        systemctl daemon-reload 2>/dev/null
         say "  stopped/disabled/removed: $name"
       fi
     fi
