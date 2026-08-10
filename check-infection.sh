@@ -125,6 +125,84 @@ safe_remove() {
 
 say "=== linux-cryptojack-hunter v$VERSION - $(hostname) - $(date) ==="
 
+# 0) Every user's crontab plus /etc/cron.d, checked and cleared FIRST —
+#    before any process gets killed below. This used to be the last check
+#    in the file (see the historical numbering "6)" still used by its
+#    detail comment below); moved to run first after catching a live race
+#    on oddify (2026-08-10): --kill killed the miner process, then before
+#    it got down to clearing the crontab, the system's own per-minute cron
+#    tick fired (the watchdog entry itself, `kill -0 <pid> || ...curl
+#    init.sh | sh`), saw the process was already dead, and relaunched the
+#    entire infection from scratch — new pid, new ld.so.preload, new
+#    systemd unit, new crontab — seconds before the reverify scan ran,
+#    which then (correctly) reported it as still CONFIRMED. Not a new
+#    attacker technique, just a self-inflicted ordering bug: as long as the
+#    watchdog cron entry outlives the process it watches, any --kill that
+#    takes more than a few seconds risks losing this exact race. Clearing
+#    the cron-based persistence before touching the process closes it.
+say "Checking crontabs and /etc/cron.d..."
+check_cron_content() {
+  local label="$1" content="$2"
+  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0
+  local decoded combined
+  decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
+    echo "$b64" | base64 -d 2>/dev/null
+  done)
+  combined="$content
+$decoded"
+  for d in "${DROPPER_DOMAINS[@]}" "${C2_IPS[@]}"; do
+    echo "$combined" | grep -qF "$d" && domain_hit=1
+  done
+  # Self-healing watchdog disguised as a cron entry instead of a systemd
+  # unit: probes its own liveness (kill -0 <pid>, pgrep, pidof, or a specific
+  # /proc/net/tcp connection) and only fetches+executes a remote payload when
+  # that check fails. A legitimate cron job essentially never combines a
+  # liveness probe with a curl/wget-to-shell fallback in the same line, so
+  # this is specific enough to treat as CONFIRMED, same as the systemd
+  # watchdog-unit check.
+  echo "$combined" | grep -qE '(kill -0|pgrep|pidof).*(curl|wget)[^|]*\|\s*(/bin/)?sh\b' && watchdog_hit=1
+  echo "$combined" | grep -qE 'base64 -d \| */bin/sh|curl[^|]*\| *(/bin/)?sh\b|wget[^|]*\| *(/bin/)?sh\b' && heuristic_hit=1
+  # @reboot persistence for a KNOWN loader binary: no domain/IP and no
+  # fetch-and-pipe in the cron line itself, since the payload is already
+  # sitting on disk (usually /var/tmp) and cron just launches it by exact
+  # filename after every reboot. This survives a plain process-kill because
+  # the process check only sees it while it is running; found live on oddify
+  # 2026-08-07 as a triplicated "@reboot cd /var/tmp && nohup ./cpu-logind
+  # -c config.json" entry that kept respawning the miner across reboots.
+  # Matching on an exact KNOWN_LOADER_FILES name (not a generic word) keeps
+  # this CONFIRMED-safe instead of a heuristic.
+  for name in "${KNOWN_LOADER_FILES[@]}"; do
+    echo "$combined" | grep -qE "(^|[/[:space:]])${name}([[:space:]]|\$)" && loader_hit=1
+  done
+
+  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ]; then
+    local check="cron-dropper"
+    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && check="cron-watchdog"
+    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && check="cron-loader-persistence"
+    record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
+    return 0
+  fi
+  if [ "$heuristic_hit" = 1 ]; then
+    record "cron-fetch-pipe-shell" "warning" "$label: $(echo "$content" | tr '\n' ';')"
+  fi
+  return 1
+}
+if has crontab; then
+  for u in $(cut -f1 -d: /etc/passwd); do
+    c=$(crontab -u "$u" -l 2>/dev/null) || continue
+    if [ -n "$c" ] && check_cron_content "crontab of $u" "$c"; then
+      [ "$KILL" = 1 ] && crontab -u "$u" -r 2>/dev/null && say "  cleared crontab: $u"
+    fi
+  done
+fi
+for f in /etc/cron.d/*; do
+  [ -f "$f" ] || continue
+  c=$(cat "$f" 2>/dev/null)
+  if check_cron_content "$f" "$c"; then
+    [ "$KILL" = 1 ] && safe_remove "$f" && say "  removed: $f"
+  fi
+done
+
 # 1) High-CPU process running from /tmp or /var/tmp. The attacker renames
 #    this binary every time (cpu-logind, dashboard, and whatever comes
 #    next), specifically to dodge exact-name matching like
@@ -581,75 +659,9 @@ if has systemctl; then
   done
 fi
 
-# 6) Every user's crontab plus /etc/cron.d. The known dropper domain is
-#    often embedded as a base64 blob rather than plain text, so any
-#    long base64-looking substring gets decoded before the domain
-#    comparison. A domain match is CONFIRMED and safe to remove; a bare
-#    "downloads and pipes into a shell" pattern is too broad to trust
-#    blindly (legitimate deploy/healthcheck scripts do this too), so it
-#    is only ever reported.
-say "Checking crontabs and /etc/cron.d..."
-check_cron_content() {
-  local label="$1" content="$2"
-  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0
-  local decoded combined
-  decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
-    echo "$b64" | base64 -d 2>/dev/null
-  done)
-  combined="$content
-$decoded"
-  for d in "${DROPPER_DOMAINS[@]}" "${C2_IPS[@]}"; do
-    echo "$combined" | grep -qF "$d" && domain_hit=1
-  done
-  # Self-healing watchdog disguised as a cron entry instead of a systemd
-  # unit: probes its own liveness (kill -0 <pid>, pgrep, pidof, or a specific
-  # /proc/net/tcp connection) and only fetches+executes a remote payload when
-  # that check fails. A legitimate cron job essentially never combines a
-  # liveness probe with a curl/wget-to-shell fallback in the same line, so
-  # this is specific enough to treat as CONFIRMED, same as the systemd
-  # watchdog-unit check.
-  echo "$combined" | grep -qE '(kill -0|pgrep|pidof).*(curl|wget)[^|]*\|\s*(/bin/)?sh\b' && watchdog_hit=1
-  echo "$combined" | grep -qE 'base64 -d \| */bin/sh|curl[^|]*\| *(/bin/)?sh\b|wget[^|]*\| *(/bin/)?sh\b' && heuristic_hit=1
-  # @reboot persistence for a KNOWN loader binary: no domain/IP and no
-  # fetch-and-pipe in the cron line itself, since the payload is already
-  # sitting on disk (usually /var/tmp) and cron just launches it by exact
-  # filename after every reboot. This survives a plain process-kill because
-  # the process check only sees it while it is running; found live on oddify
-  # 2026-08-07 as a triplicated "@reboot cd /var/tmp && nohup ./cpu-logind
-  # -c config.json" entry that kept respawning the miner across reboots.
-  # Matching on an exact KNOWN_LOADER_FILES name (not a generic word) keeps
-  # this CONFIRMED-safe instead of a heuristic.
-  for name in "${KNOWN_LOADER_FILES[@]}"; do
-    echo "$combined" | grep -qE "(^|[/[:space:]])${name}([[:space:]]|\$)" && loader_hit=1
-  done
-
-  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ]; then
-    local check="cron-dropper"
-    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && check="cron-watchdog"
-    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && check="cron-loader-persistence"
-    record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
-    return 0
-  fi
-  if [ "$heuristic_hit" = 1 ]; then
-    record "cron-fetch-pipe-shell" "warning" "$label: $(echo "$content" | tr '\n' ';')"
-  fi
-  return 1
-}
-if has crontab; then
-  for u in $(cut -f1 -d: /etc/passwd); do
-    c=$(crontab -u "$u" -l 2>/dev/null) || continue
-    if [ -n "$c" ] && check_cron_content "crontab of $u" "$c"; then
-      [ "$KILL" = 1 ] && crontab -u "$u" -r 2>/dev/null && say "  cleared crontab: $u"
-    fi
-  done
-fi
-for f in /etc/cron.d/*; do
-  [ -f "$f" ] || continue
-  c=$(cat "$f" 2>/dev/null)
-  if check_cron_content "$f" "$c"; then
-    [ "$KILL" = 1 ] && safe_remove "$f" && say "  removed: $f"
-  fi
-done
+# 6) (moved to run first, right after the header — see the "0)" comment
+#    near the top of the file for why. Left this number gap intentionally
+#    instead of renumbering every other section.)
 
 # 7) --deep only: binaries in system directories not owned by any
 #    installed package. A real, general-purpose technique (the same idea
