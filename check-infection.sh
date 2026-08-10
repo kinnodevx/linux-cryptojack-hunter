@@ -123,6 +123,49 @@ safe_remove() {
   rm -f "$path"
 }
 
+# Forensics for a CONFIRMED malicious process: full parent chain up to init,
+# plus the most recent web-server access-log lines, appended to a standing
+# log file. Every check in this script so far only ever answered "what is
+# running and how do I kill it" — after weeks of the same campaign coming
+# back on both VPS with no confirmed entry vector, this answers "what
+# spawned it" instead. Called before kill (or in report-only mode too, so a
+# plain cron run still captures it) for every check that identifies a
+# specific malicious PID. Read-only: walks /proc and tails existing log
+# files, never touches anything.
+FORENSICS_LOG="/root/infection-forensics.log"
+capture_forensics() {
+  local pid="$1" context="$2"
+  [ -d "/proc/$pid" ] || return 0
+  {
+    echo "=== forensics: $context, pid=$pid, $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "-- process ancestry (this pid up to init) --"
+    local p="$pid" depth=0 ppid comm exe cmdline
+    while [ -n "$p" ] && [ "$p" != "0" ] && [ "$depth" -lt 15 ]; do
+      if [ -r "/proc/$p/stat" ]; then
+        comm=$(cat "/proc/$p/comm" 2>/dev/null)
+        exe=$(readlink "/proc/$p/exe" 2>/dev/null)
+        ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+        cmdline=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+        echo "  pid=$p ppid=$ppid comm=$comm exe=${exe:-?} cmdline=${cmdline:-?}"
+        p="$ppid"
+      else
+        echo "  pid=$p (already gone from /proc, chain stops here)"
+        break
+      fi
+      depth=$((depth + 1))
+    done
+    echo "-- sockets currently held by this pid --"
+    has ss && ss -tnp 2>/dev/null | grep -F "pid=$pid,"
+    echo "-- last 100 lines of any nginx access log on the box (manual eyeballing, no automated correlation yet) --"
+    for log in /var/log/nginx/*access*.log; do
+      [ -f "$log" ] && tail -n 100 "$log" 2>/dev/null
+    done
+    echo "=== end forensics ==="
+    echo
+  } >> "$FORENSICS_LOG" 2>/dev/null
+  say "  forensics for pid $pid captured to $FORENSICS_LOG"
+}
+
 say "=== linux-cryptojack-hunter v$VERSION - $(hostname) - $(date) ==="
 
 # 0) Every user's crontab plus /etc/cron.d, checked and cleared FIRST —
@@ -221,6 +264,7 @@ if has ps && has awk; then
     case "$exe" in
       /tmp/*|/var/tmp/*)
         record "tmp-exec" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+        capture_forensics "$pid" "tmp-exec"
         if [ "$KILL" = 1 ]; then
           kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
           [ -n "$exe" ] && [ -f "$exe" ] && safe_remove "$exe" && say "  removed: $exe"
@@ -245,6 +289,7 @@ if has ps && has awk; then
         # specific directories that can never legitimately hold an
         # executable is the safe version of the same idea.
         record "doc-dir-exec" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+        capture_forensics "$pid" "doc-dir-exec"
         if [ "$KILL" = 1 ]; then
           kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
           [ -f "$exe" ] && safe_remove "$exe" && say "  removed: $exe"
@@ -271,6 +316,7 @@ if has pgrep; then
       [ -s "/proc/$pid/cmdline" ] || continue
       exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
       record "fake-kernel-thread" "confirmed" "pid=$pid name=$name has a non-empty cmdline (real kernel threads never do) exe=${exe:-?}"
+      capture_forensics "$pid" "fake-kernel-thread"
       if [ "$KILL" = 1 ]; then
         kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
         [ -n "$exe" ] && [ -f "$exe" ] && safe_remove "$exe" && say "  removed binary: $exe"
@@ -459,11 +505,10 @@ if has ss; then
     hits=$(ss -tnp 2>/dev/null | grep -F "$ip")
     if [ -n "$hits" ]; then
       record "c2-connection" "confirmed" "active connection to $ip: $(echo "$hits" | tr '\n' ';')"
-      if [ "$KILL" = 1 ]; then
-        echo "$hits" | grep -oP 'pid=\K[0-9]+' | sort -u | while read -r pid; do
-          kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
-        done
-      fi
+      echo "$hits" | grep -oP 'pid=\K[0-9]+' | sort -u | while read -r pid; do
+        capture_forensics "$pid" "c2-connection ($ip)"
+        [ "$KILL" = 1 ] && kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+      done
     fi
   done
 elif has netstat; then
