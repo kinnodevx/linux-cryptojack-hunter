@@ -635,9 +635,36 @@ if has systemctl; then
     if systemctl list-units --all --no-legend 2>/dev/null | grep -q "$name"; then
       record "known-unit" "confirmed" "$name"
       if [ "$KILL" = 1 ]; then
+        # Grab the ExecStart target before the unit file is gone — same
+        # lesson as known-loader-file: stopping/deleting the unit does not
+        # touch whatever binary it launched, so a payload dropped alongside
+        # it survives the "clean" system untouched. Caught live on oddify
+        # 2026-08-11: this block correctly removed `moneroocean_miner` (an
+        # XMRig install from MoneroOcean's own public setup script) but
+        # left the entire /root/moneroocean/ directory — binary, config,
+        # log — sitting on disk, because that cleanup only ever lived in
+        # the newer miner-systemd-unit check below, which never got a
+        # chance to run since this block (earlier in the script) had
+        # already deleted the unit file by the time it did.
+        #
+        # Scoped deliberately to a short list of drop locations rather than
+        # "wherever ExecStart points": a known-unit name could in principle
+        # front-run a legitimate system binary (e.g. a future addition to
+        # KNOWN_UNIT_NAMES pointing at /usr/bin/something), and blindly
+        # rm -rf'ing that ExecStart's parent directory would be catastrophic.
+        # /root, /tmp, /var/tmp, /home, /opt are never legitimate homes for
+        # a systemd ExecStart target, so removing their subtree here carries
+        # the same safety guarantee as the /tmp-scoped process checks above.
+        exec_target=$(grep -oE 'ExecStart=[^[:space:]]+' "/etc/systemd/system/${name}.service" 2>/dev/null | head -1 | cut -d= -f2)
         systemctl stop "$name.service" "$name.timer" 2>/dev/null
         systemctl disable "$name.service" "$name.timer" 2>/dev/null
         find /etc/systemd/system -iname "${name}*" -delete 2>/dev/null
+        case "$exec_target" in
+          /root/*|/tmp/*|/var/tmp/*|/home/*|/opt/*)
+            payload_dir=$(dirname "$exec_target")
+            [ -d "$payload_dir" ] && rm -rf "$payload_dir" && say "  removed payload directory: $payload_dir"
+            ;;
+        esac
         # Without this, systemd keeps the unit "Loaded" from its in-memory
         # cache even after the file is gone, so `list-units --all` (what the
         # check above greps) keeps matching it on the next run — a clean
@@ -655,6 +682,46 @@ if has systemctl; then
   [ -n "$newer" ] && record "unit-newer-than-host" "warning" "unit file(s) newer than /etc/hostname: $(echo "$newer" | tr '\n' ';')"
 else
   say "  skipped (systemctl not available)"
+fi
+
+# 5a2) systemd unit whose ExecStart runs a binary literally named `xmrig`.
+#      Found live on oddify 2026-08-11 as `moneroocean_miner.service`,
+#      installed straight from MoneroOcean's own public setup script
+#      (github.com/MoneroOcean/xmrig_setup) — a real, unmodified miner
+#      binary, self-installed with a legitimate-sounding unit description
+#      ("Monero miner service") and throttled (Nice=10) to stay under the
+#      radar of anything watching for a loud, obviously-malicious process.
+#      This traced back to the actual entry vector for the first time in
+#      this campaign's history: `ppid` on the shell that ran the installer
+#      was the live scratchcard-backoffice Next.js server (port 4000) —
+#      confirmed RCE in a production app, not the usual /tmp dropper this
+#      script has been chasing. Matching on the literal binary name (not
+#      the unit name, which the attacker could rename next time, or the
+#      install directory) is what makes this durable — xmrig itself is
+#      never going to be renamed, that's the actual miner.
+say "Checking systemd units for an ExecStart running a binary named xmrig..."
+if has systemctl; then
+  for unit_file in /etc/systemd/system/*.service; do
+    [ -f "$unit_file" ] || continue
+    if grep -qE 'ExecStart=.*/xmrig([[:space:]]|$)' "$unit_file" 2>/dev/null; then
+      unit_name=$(basename "$unit_file" .service)
+      target=$(grep -oE 'ExecStart=[^[:space:]]+' "$unit_file" | head -1 | cut -d= -f2)
+      record "miner-systemd-unit" "confirmed" "$unit_file runs $target: $(tr '\n' ';' < "$unit_file")"
+      if [ "$KILL" = 1 ]; then
+        systemctl stop "$unit_name" 2>/dev/null
+        systemctl disable "$unit_name" 2>/dev/null
+        safe_remove "$unit_file"
+        # Remove the whole install directory (config/log/binary), not just
+        # the xmrig binary itself — same lesson as known-loader-file: a
+        # kill that only stops the process/unit but leaves the payload on
+        # disk means the next reboot (or a stray `systemctl start`) brings
+        # it right back with nothing left to re-download.
+        [ -n "$target" ] && [ -d "$(dirname "$target")" ] && rm -rf "$(dirname "$target")" && say "  removed: $(dirname "$target")"
+        systemctl daemon-reload 2>/dev/null
+        say "  stopped/disabled/removed: $unit_name"
+      fi
+    fi
+  done
 fi
 
 # 5b) Disguised systemd watchdog: the unit's own NAME changes every time,
