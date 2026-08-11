@@ -674,6 +674,16 @@ if has systemctl; then
         # two systemd-unit checks below already had this line; this one just
         # never got it when it was written first.
         systemctl daemon-reload 2>/dev/null
+        # daemon-reload alone isn't enough for a unit that ended up in
+        # "failed" state (as opposed to just "loaded from a since-deleted
+        # file") — systemd keeps failed units in its bookkeeping until an
+        # explicit reset-failed, so list-units --all kept matching this one
+        # after a full, verified-complete removal (unit file gone, payload
+        # directory gone) on 149.28.123.247: the moneroocean_miner install
+        # there had failed to launch in the first place (203/EXEC, bad
+        # binary path) and sat in that failed state for days, which this
+        # check's daemon-reload never cleared.
+        systemctl reset-failed "$name.service" "$name.timer" 2>/dev/null
         say "  stopped/disabled/removed: $name"
       fi
     fi
@@ -718,6 +728,7 @@ if has systemctl; then
         # it right back with nothing left to re-download.
         [ -n "$target" ] && [ -d "$(dirname "$target")" ] && rm -rf "$(dirname "$target")" && say "  removed: $(dirname "$target")"
         systemctl daemon-reload 2>/dev/null
+        systemctl reset-failed "$unit_name.service" 2>/dev/null
         say "  stopped/disabled/removed: $unit_name"
       fi
     fi
@@ -743,6 +754,7 @@ if has systemctl; then
         safe_remove "$unit_file"
         find /etc/systemd/system -maxdepth 2 -iname "${unit_name%.service}*" -delete 2>/dev/null
         systemctl daemon-reload 2>/dev/null
+        systemctl reset-failed "$unit_name" 2>/dev/null
         say "  stopped/disabled/removed: $unit_name"
       fi
     fi
@@ -775,6 +787,7 @@ if has systemctl; then
         safe_remove "$unit_file"
         safe_remove "$target"
         systemctl daemon-reload 2>/dev/null
+        systemctl reset-failed "$unit_name" 2>/dev/null
         say "  stopped/disabled/removed: $unit_name and $target"
       fi
     fi
