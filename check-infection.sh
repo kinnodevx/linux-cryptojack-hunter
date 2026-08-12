@@ -240,11 +240,54 @@ $decoded"
   fi
   return 1
 }
+# Per-line version of the same three CONFIRMED checks above (domain/IP,
+# watchdog liveness-probe, known-loader @reboot persistence), used only to
+# decide what to KEEP when cleaning a crontab. A user's crontab is not
+# self-contained: root's crontab on a real box mixes this campaign's
+# persistence with entirely unrelated legitimate jobs. Found live on oddify
+# (2026-08-12): a --kill run matched one malicious watchdog line in root's
+# crontab and, at the time, removed the whole crontab via `crontab -r` —
+# which also silently deleted an unrelated legitimate cron entry (a
+# te.la app's payment-delivery retry job) that happened to live in the same
+# file. That job's absence went unnoticed until a customer-facing symptom
+# (delayed Telegram invite delivery) surfaced days later. `crontab -r`
+# deletes the entire file for that user with no way to recover just the
+# legitimate lines afterward, so from here on cleanup is surgical: rebuild
+# the crontab from only the lines that do NOT match, and only fall back to
+# removing the file entirely if literally nothing legitimate is left.
+cron_line_is_malicious() {
+  local line="$1" decoded combined
+  decoded=$(echo "$line" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
+    echo "$b64" | base64 -d 2>/dev/null
+  done)
+  combined="$line
+$decoded"
+  for d in "${DROPPER_DOMAINS[@]}" "${C2_IPS[@]}"; do
+    echo "$combined" | grep -qF "$d" && return 0
+  done
+  echo "$combined" | grep -qE '(kill -0|pgrep|pidof).*(curl|wget)[^|]*\|\s*(/bin/)?sh\b' && return 0
+  for name in "${KNOWN_LOADER_FILES[@]}"; do
+    echo "$combined" | grep -qE "(^|[/[:space:]])${name}([[:space:]]|\$)" && return 0
+  done
+  return 1
+}
 if has crontab; then
   for u in $(cut -f1 -d: /etc/passwd); do
     c=$(crontab -u "$u" -l 2>/dev/null) || continue
     if [ -n "$c" ] && check_cron_content "crontab of $u" "$c"; then
-      [ "$KILL" = 1 ] && crontab -u "$u" -r 2>/dev/null && say "  cleared crontab: $u"
+      if [ "$KILL" = 1 ]; then
+        clean=$(printf '%s\n' "$c" | while IFS= read -r cronline; do
+          [ -z "$cronline" ] && { printf '%s\n' "$cronline"; continue; }
+          cron_line_is_malicious "$cronline" || printf '%s\n' "$cronline"
+        done)
+        if [ -n "$(printf '%s' "$clean" | tr -d '[:space:]')" ]; then
+          printf '%s\n' "$clean" | crontab -u "$u" -
+          say "  removed malicious line(s) from crontab, kept the rest: $u"
+        else
+          crontab -u "$u" -r 2>/dev/null
+          say "  cleared crontab (nothing legitimate left): $u"
+        fi
+      fi
     fi
   done
 fi
