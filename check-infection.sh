@@ -224,8 +224,19 @@ $decoded"
   # -c config.json" entry that kept respawning the miner across reboots.
   # Matching on an exact KNOWN_LOADER_FILES name (not a generic word) keeps
   # this CONFIRMED-safe instead of a heuristic.
+  #
+  # \.? before the name: a bare boundary char ([/[:space:]] or start) is not
+  # enough on its own once a loader uses the dotfile convention (.khp seen
+  # live on oddify 2026-08-13, direct "* * * * * /bin/.khp" persistence —
+  # no watchdog probe, no domain/IP in the line itself, so domain_hit and
+  # watchdog_hit both stayed 0 and this loop was the only thing that could
+  # have caught it). Without the optional dot, "/bin/.khp" left a literal
+  # "." sitting between the "/" boundary and "khp", which the character
+  # class never allowed, so loader_hit silently stayed 0 for a fully
+  # correct KNOWN_LOADER_FILES entry ("khp" was already listed) and the
+  # line was treated as ordinary content forever.
   for name in "${KNOWN_LOADER_FILES[@]}"; do
-    echo "$combined" | grep -qE "(^|[/[:space:]])${name}([[:space:]]|\$)" && loader_hit=1
+    echo "$combined" | grep -qE "(^|[/[:space:]])\.?${name}([[:space:]]|\$)" && loader_hit=1
   done
 
   if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ]; then
@@ -266,8 +277,12 @@ $decoded"
     echo "$combined" | grep -qF "$d" && return 0
   done
   echo "$combined" | grep -qE '(kill -0|pgrep|pidof).*(curl|wget)[^|]*\|\s*(/bin/)?sh\b' && return 0
+  # \.? before the name: same dotfile-boundary gap as check_cron_content
+  # above (kept in sync — this is the surgical per-line cleaner, so missing
+  # it here means a line like "* * * * * /bin/.khp" gets silently KEPT
+  # during a --kill crontab rebuild instead of stripped).
   for name in "${KNOWN_LOADER_FILES[@]}"; do
-    echo "$combined" | grep -qE "(^|[/[:space:]])${name}([[:space:]]|\$)" && return 0
+    echo "$combined" | grep -qE "(^|[/[:space:]])\.?${name}([[:space:]]|\$)" && return 0
   done
   return 1
 }
@@ -517,8 +532,46 @@ if has lsattr; then
     case "$flags" in
       *i*|*a*)
         record "tmp-locked" "confirmed" "$dir has attributes '$flags' set (immutable/append-only), not normal for a scratch directory"
-        if [ "$KILL" = 1 ] && has chattr; then
-          chattr -i -a "$dir" 2>/dev/null && say "  cleared attributes on $dir"
+        if [ "$KILL" = 1 ]; then
+          if has chattr; then
+            chattr -i -a "$dir" 2>/dev/null && say "  cleared attributes on $dir" || say "  chattr present but failed to clear attributes on $dir — check manually"
+          else
+            say "  chattr not available, could not clear attributes on $dir — reinstall e2fsprogs (note: a locked /tmp can itself block apt's own temp files; see 1c for the TMPDIR workaround) then rerun --kill"
+          fi
+        fi
+        ;;
+    esac
+  done
+else
+  say "  skipped (lsattr not available)"
+fi
+
+# 1f-ii) Immutable or append-only attribute on the crontab spool file itself
+#     (/var/spool/cron/crontabs/<user>, not just the directory). A step
+#     beyond 1f: locking the spool file blocks `crontab -e`/`crontab -`
+#     from writing at all (fails with "rename: Operation not permitted"),
+#     which means a malicious cron line survives even a successful-looking
+#     `crontab -l | grep -v ... | crontab -` — the write silently fails and
+#     the next `crontab -l` right after can still show the old in-memory/
+#     cached listing, making the removal look like it worked when it did
+#     not. Seen live on oddify 2026-08-13 (the .khp/javab incident): this
+#     is what let a single "* * * * * /bin/.khp" line survive multiple
+#     rounds of manual cleanup. Safe to clear automatically, same reasoning
+#     as 1f — a legitimate crontab spool file is never immutable.
+say "Checking the crontab spool file itself for a spurious immutable/append lock..."
+if has lsattr; then
+  for spool in /var/spool/cron/crontabs/* /var/spool/cron/*; do
+    [ -f "$spool" ] || continue
+    flags=$(lsattr "$spool" 2>/dev/null | awk '{print $1}')
+    case "$flags" in
+      *i*|*a*)
+        record "crontab-spool-locked" "confirmed" "$spool has attributes '$flags' set (immutable/append-only) — blocks crontab writes for this user even though \`crontab -l\` may still look normal"
+        if [ "$KILL" = 1 ]; then
+          if has chattr; then
+            chattr -i -a "$spool" 2>/dev/null && say "  cleared attributes on $spool" || say "  chattr present but failed to clear attributes on $spool — check manually"
+          else
+            say "  chattr not available, could not clear attributes on $spool — reinstall e2fsprogs then rerun --kill"
+          fi
         fi
         ;;
     esac
@@ -543,7 +596,13 @@ if has lsattr; then
     case "$flags" in
       *i*)
         record "logging-binary-locked" "confirmed" "$bin has the immutable attribute set ('$flags'), which blocks its own future updates and can leave it dead after the next upgrade"
-        [ "$KILL" = 1 ] && has chattr && chattr -i "$bin" 2>/dev/null && say "  cleared immutable attribute on $bin"
+        if [ "$KILL" = 1 ]; then
+          if has chattr; then
+            chattr -i "$bin" 2>/dev/null && say "  cleared immutable attribute on $bin" || say "  chattr present but failed to clear immutable attribute on $bin — check manually"
+          else
+            say "  chattr not available, could not clear immutable attribute on $bin — reinstall e2fsprogs then rerun --kill"
+          fi
+        fi
         ;;
     esac
   done
@@ -636,11 +695,28 @@ for bin in "${WRAPPED_BIN_CANDIDATES[@]}"; do
   if echo "$content" | grep -qE '\.original\b.*\|[[:space:]]*grep[[:space:]]+-v'; then
     record "utility-hijacked" "confirmed" "$path is a wrapper hiding output from the real binary: $(echo "$content" | tr '\n' ';')"
     if [ "$KILL" = 1 ]; then
-      pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1 | head -1)
-      if [ -n "$pkg" ]; then
-        apt-get install --reinstall -y "$pkg" >/dev/null 2>&1 && say "  reinstalled package '$pkg' to restore $path"
+      # Prefer restoring the preserved "$path.original" sibling directly
+      # over a package reinstall: it needs no network and no apt (which
+      # itself needs a writable /tmp for its temp files — see 1f/1c), and
+      # it's exactly what the wrapper script itself shells out to, so if
+      # it's there it is by construction the same binary that was renamed
+      # away. Only fall back to apt if that sibling is gone (seen live on
+      # oddify: ps.original had already been removed by the time this was
+      # found, leaving the wrapper 100% broken with nothing to fall back
+      # on locally).
+      if [ -f "${path}.original" ]; then
+        mv "${path}.original" "$path" 2>/dev/null && chmod 755 "$path" 2>/dev/null && say "  restored $path from its preserved .original copy"
       else
-        say "  could not determine the owning package for $path — not auto-fixed, reinstall it manually"
+        pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1 | head -1)
+        if [ -n "$pkg" ]; then
+          if apt-get install --reinstall -y "$pkg" >/dev/null 2>&1; then
+            say "  reinstalled package '$pkg' to restore $path"
+          else
+            say "  apt-get install --reinstall failed for '$pkg' (a locked /tmp can cause this — see 1f) — $path not auto-fixed, restore it manually"
+          fi
+        else
+          say "  no .original sibling and could not determine the owning package for $path — not auto-fixed, restore it manually"
+        fi
       fi
     fi
   fi
