@@ -610,6 +610,62 @@ else
   say "  skipped (lsattr not available)"
 fi
 
+# 1h) Any LIVE process whose backing binary is literally named `xmrig`,
+#     regardless of how it was launched. The systemd-unit-specific check
+#     further below (miner-systemd-unit) only catches the case where a
+#     unit file's ExecStart runs it; found live on oddify 2026-08-13
+#     launched as a bare orphaned process (ppid=1, no systemd unit at
+#     all, presumably `nohup .../xmrig ... &` disowned from the RCE's
+#     shell) sitting directly inside the vulnerable app's own directory
+#     (/var/www/scratchcard/backoffice/xmrig-6.21.0/xmrig) rather than
+#     /tmp or /root — a new drop location for this campaign, and one
+#     `tmp-exec` (which only looks at /tmp/var-tmp) never covers.
+#     Matching the literal binary name is durable because xmrig itself
+#     is never renamed, only where/how it's run changes. Reads /proc
+#     directly (not `ps`) for the same reason as the fake-kernel-thread/
+#     self-relaunch checks below — don't trust a possibly-hijacked `ps`.
+#
+#     Placement matters: this runs BEFORE the c2-connection check just
+#     below. First version had this check after c2-connection, and lost
+#     the cleanup race every time on oddify — c2-connection matches the
+#     same live process (via its C2 IP) and kills it first, but only
+#     kills the pid, never touches the binary on disk. By the time this
+#     check ran, /proc/PID/exe was already gone (process dead) and there
+#     was nothing left to remove, leaving the 8.9MB binary + config.json
+#     orphaned on disk indefinitely. Moving this earlier means it kills
+#     AND removes the binary first; c2-connection's own kill attempt
+#     right after becomes a harmless no-op against an already-dead pid.
+say "Checking for any running process backed by a binary literally named xmrig..."
+for d in /proc/[0-9]*; do
+  pid=${d##*/}
+  exe=$(readlink "$d/exe" 2>/dev/null) || continue
+  case "$exe" in
+    */xmrig)
+      capture_forensics "$pid" "xmrig-process"
+      record "xmrig-process" "confirmed" "pid=$pid running from $exe"
+      if [ "$KILL" = 1 ]; then
+        kill -9 "$pid" 2>/dev/null
+        say "  killed pid $pid"
+        parent_dir=$(dirname "$exe")
+        case "$(basename "$parent_dir")" in
+          xmrig*|Xmrig*|XMRig*)
+            # Versioned install dir (xmrig-6.21.0/ etc) belongs to the
+            # miner, not the host app — safe to remove entirely, same as
+            # miner-systemd-unit's install-directory cleanup below.
+            rm -rf "$parent_dir" && say "  removed: $parent_dir"
+            ;;
+          *)
+            # Parent dir doesn't look miner-specific (could be the app's
+            # own root) — only remove the binary itself, not the directory
+            # it's sitting in.
+            safe_remove "$exe" && say "  removed: $exe"
+            ;;
+        esac
+      fi
+      ;;
+  esac
+done
+
 # 2) Network connections to a known C2 IP.
 say "Checking network connections to known C2 IPs..."
 if has ss; then
