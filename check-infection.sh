@@ -1059,6 +1059,48 @@ if has systemctl; then
   done
 fi
 
+# 5e) systemd unit file in /etc/systemd/system/ whose own FILENAME is a
+#     hidden dotfile (e.g. .systemd-guard.service). Found live on oddify
+#     2026-08-19, same incident as 5d above but a separate, previously-
+#     uncaught layer: alongside the shadowed systemd-udevd.service, a THIRD
+#     independent persistence copy sat at
+#     /etc/systemd/system/.systemd-guard.service — Description="System
+#     Guard Service" (a plausible-sounding, unique name with no real
+#     package-provided counterpart in /usr/lib/systemd/system/, so 5d's
+#     shadow-comparison never looks at it), ExecStart=/root/.tyosanstpddt
+#     --guard, Restart=always. Disabled (not wired into any target) at
+#     discovery time, so not itself what was keeping the boot-time
+#     reinfection alive, but exactly the kind of redundant, easy-to-miss
+#     backup persistence this campaign has repeated before (triple
+#     redundancy: unit + cron.d + crontab, all launching the same binary).
+#     No existing check catches a hidden unit FILENAME specifically: 1d
+#     only scans /bin,/usr/bin,/sbin,/usr/sbin for hidden dotfile
+#     executables, not /etc/systemd/system/ for hidden dotfile unit files;
+#     watchdog-unit (5b) matches on ExecStart content, not the unit's own
+#     name; shadowed-system-unit (5d) requires a same-named package unit to
+#     compare against, which a unique attacker-chosen name never has. A
+#     legitimate systemd unit file is never itself a dotfile — every
+#     package-provided and admin-authored unit uses a plain, referenceable
+#     name (systemd-udevd.service, pm2-root.service, nginx.service, ...);
+#     hiding the filename only serves to dodge a casual `ls` — so this is
+#     CONFIRMED with no realistic false-positive path.
+say "Checking for a systemd unit file whose own filename is a hidden dotfile..."
+if has systemctl; then
+  for unit_file in /etc/systemd/system/.*.service /etc/systemd/system/.*.timer; do
+    [ -f "$unit_file" ] || continue
+    name=$(basename "$unit_file")
+    record "hidden-unit-filename" "confirmed" "$unit_file: $(tr '\n' ';' < "$unit_file")"
+    if [ "$KILL" = 1 ]; then
+      systemctl stop "$name" 2>/dev/null
+      systemctl disable "$name" 2>/dev/null
+      safe_remove "$unit_file"
+      systemctl daemon-reload 2>/dev/null
+      systemctl reset-failed "$name" 2>/dev/null
+      say "  stopped/disabled/removed: $name"
+    fi
+  done
+fi
+
 # 6) (moved to run first, right after the header — see the "0)" comment
 #    near the top of the file for why. Left this number gap intentionally
 #    instead of renumbering every other section.)
