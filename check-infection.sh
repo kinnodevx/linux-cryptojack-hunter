@@ -666,6 +666,44 @@ for d in /proc/[0-9]*; do
   esac
 done
 
+# 1h) Any LIVE process whose backing binary (/proc/PID/exe) is a hidden
+#     dotfile — regardless of where it lives or what name the process shows
+#     itself under. Found live on oddify 2026-08-19: the payload
+#     (/root/.iatlcmpzgbog, a UPX-packed static ELF) ran with argv[0]/comm
+#     rewritten to "next-server" — the exact name of the 3 legitimate
+#     Next.js frontends already running on this box — so it blended into a
+#     plain `ps` listing instead of standing out as a random string or a
+#     fake kernel thread. Every other process-identity check in this script
+#     (fake-kernel-thread, self-relaunch-loader, xmrig-process) matches on
+#     the process's declared NAME or cmdline; this one instead resolves the
+#     real backing executable and checks only that, so a spoofed name can't
+#     hide it. A legitimate compiled binary is essentially never itself a
+#     dotfile (a hidden parent directory is normal — ~/.cargo/bin/,
+#     ~/.local/bin/ — a hidden FILENAME for the executable is not), so this
+#     carries no meaningful false-positive rate. Not scoped to /tmp/var-tmp
+#     or /bin/usr-bin like the file-based hidden-binary check (1d) — this
+#     incident's drop location was /root, which none of those
+#     directory-scoped checks ever look at, and the next one could be
+#     anywhere.
+say "Checking for any running process whose backing binary is a hidden dotfile..."
+for d in /proc/[0-9]*; do
+  pid=${d##*/}
+  exe=$(readlink "$d/exe" 2>/dev/null) || continue
+  base=$(basename "$exe")
+  case "$base" in
+    .*)
+      comm=$(cat "$d/comm" 2>/dev/null)
+      capture_forensics "$pid" "hidden-exe-process"
+      record "hidden-exe-process" "confirmed" "pid=$pid comm=${comm:-?} exe=$exe (process name does not reveal this)"
+      if [ "$KILL" = 1 ]; then
+        kill -9 "$pid" 2>/dev/null
+        say "  killed pid $pid"
+        safe_remove "$exe" && say "  removed: $exe"
+      fi
+      ;;
+  esac
+done
+
 # 2) Network connections to a known C2 IP.
 say "Checking network connections to known C2 IPs..."
 if has ss; then
@@ -964,6 +1002,58 @@ if has systemctl; then
         systemctl daemon-reload 2>/dev/null
         systemctl reset-failed "$unit_name" 2>/dev/null
         say "  stopped/disabled/removed: $unit_name and $target"
+      fi
+    fi
+  done
+fi
+
+# 5d) systemd unit in /etc/systemd/system/ that SHADOWS a real, package-
+#     provided unit of the same name in /usr/lib/systemd/system/ (systemd's
+#     unit search order gives /etc/ precedence), with a different ExecStart
+#     than the package original. Found live on oddify 2026-08-19: a fake
+#     `systemd-udevd.service` was dropped straight into /etc/systemd/system/
+#     with ExecStart=/root/.iatlcmpzgbog — udev is socket-activated and
+#     fires constantly on any real system, so this guaranteed frequent,
+#     innocuous-looking relaunches (`systemctl status` even showed it
+#     triggered by the genuine systemd-udevd-{control,kernel,varlink}.socket
+#     units) without needing Restart=always or a cron watchdog at all,
+#     though both were ALSO present at the same time (triple redundant
+#     persistence: this unit, a matching /etc/cron.d/systemd-udevd, and a
+#     root crontab line, all launching the identical binary — the crontab
+#     and cron.d copies were both bare "* * * * * /root/.iatlcmpzgbog" with
+#     no domain/IP/watchdog-probe/known-loader-name in the line, so
+#     check_cron_content above did not flag either one; this incident's
+#     real catch is this check plus hidden-exe-process above, not the cron
+#     content checks). None of the existing systemd checks catch this:
+#     known-unit only matches a hardcoded list of attacker-chosen names
+#     (this uses a real OS name, never going to be on that list),
+#     watchdog-unit's hidden-dotfile regex is scoped to
+#     /bin,/usr/bin,/sbin,/usr/sbin (ExecStart here was /root/., outside all
+#     four), and miner-systemd-unit/boilerplate-reexec look for entirely
+#     different signatures. The structural tell used here — same unit name
+#     present in both /etc/systemd/system/ and /usr/lib/systemd/system/, but
+#     with a different ExecStart — has nowhere near the false-positive risk
+#     of a name blacklist: a real local override of a package unit almost
+#     always lives in a <unit>.service.d/override.conf drop-in, not a full
+#     same-named file replacing ExecStart outright.
+say "Checking for a systemd unit shadowing a real package-provided unit..."
+if has systemctl; then
+  for unit_file in /etc/systemd/system/*.service; do
+    [ -f "$unit_file" ] || continue
+    name=$(basename "$unit_file")
+    pkg_file="/usr/lib/systemd/system/$name"
+    [ -f "$pkg_file" ] || continue
+    exec_local=$(grep -oE '^ExecStart=.*' "$unit_file" 2>/dev/null | head -1)
+    exec_pkg=$(grep -oE '^ExecStart=.*' "$pkg_file" 2>/dev/null | head -1)
+    if [ -n "$exec_local" ] && [ "$exec_local" != "$exec_pkg" ]; then
+      record "shadowed-system-unit" "confirmed" "$unit_file overrides package unit $pkg_file — local: $exec_local vs package: ${exec_pkg:-<none>}"
+      if [ "$KILL" = 1 ]; then
+        systemctl stop "$name" 2>/dev/null
+        systemctl disable "$name" 2>/dev/null
+        safe_remove "$unit_file"
+        systemctl daemon-reload 2>/dev/null
+        systemctl reset-failed "$name" 2>/dev/null
+        say "  removed override, restored package unit: $name"
       fi
     fi
   done
