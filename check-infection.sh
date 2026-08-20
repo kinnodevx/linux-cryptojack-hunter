@@ -727,13 +727,48 @@ else
 fi
 
 # 2b) Outbound connection to a common mining-pool port. Not proof on its
-#     own (a handful of legitimate services use these ports too), so this
-#     is a WARNING.
+#     own (a handful of legitimate services use these ports too), so a plain
+#     hit is a WARNING — EXCEPT when the connecting pid's own backing binary
+#     has already been deleted (readlink shows "... (deleted)"), which no
+#     legitimate long-lived service does. Found live on oddify 2026-08-19:
+#     a process named `U2zQlN6g` (random, no dot, sitting directly in
+#     /root/ — not covered by known-loader-file, hidden-exe-process, or
+#     deleted-exe's location scoping, which only watches /tmp,/var/tmp,
+#     /dev/shm,dotfiles) held an ESTABLISHED connection to port 33333 for
+#     14+ minutes with PPID=1 (orphaned) and `/proc/PID/exe` already
+#     resolving to "/root/U2zQlN6g (deleted)". It survived a full
+#     report-mode pass with only a WARNING logged, and was only caught
+#     because a human happened to read the warning line and killed it by
+#     hand. A mining-port hit combined with a deleted backing binary is
+#     unambiguous (the exe deleting itself post-launch is standard evasion
+#     in this campaign, never something a real service does while still
+#     connected), so that specific combination is promoted to CONFIRMED and
+#     killed under --kill; a mining-port hit with an intact, resolvable exe
+#     stays a WARNING as before.
 say "Checking for connections to common mining-pool ports..."
 if has ss; then
   for port in "${MINING_PORTS[@]}"; do
     hits=$(ss -tnp state established "( dport = :$port )" 2>/dev/null | tail -n +2)
-    [ -n "$hits" ] && record "mining-port" "warning" "established connection to port $port: $(echo "$hits" | tr '\n' ';')"
+    [ -z "$hits" ] && continue
+    confirmed_pids=""
+    while read -r pid; do
+      [ -z "$pid" ] && continue
+      link=$(readlink "/proc/$pid/exe" 2>/dev/null)
+      case "$link" in
+        *" (deleted)")
+          confirmed_pids="$confirmed_pids $pid"
+          ;;
+      esac
+    done < <(echo "$hits" | grep -oP 'pid=\K[0-9]+' | sort -u)
+    if [ -n "$confirmed_pids" ]; then
+      record "mining-port-deleted-exe" "confirmed" "established connection to port $port from a pid with a deleted backing binary: $(echo "$hits" | tr '\n' ';')"
+      for pid in $confirmed_pids; do
+        capture_forensics "$pid" "mining-port-deleted-exe (port $port)"
+        [ "$KILL" = 1 ] && kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+      done
+    else
+      record "mining-port" "warning" "established connection to port $port: $(echo "$hits" | tr '\n' ';')"
+    fi
   done
 else
   say "  skipped (ss not available)"
