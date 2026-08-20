@@ -364,6 +364,38 @@ if has ps && has awk; then
         fi
         ;;
     esac
+    # 1a-iii) High-CPU process backed by a binary buried 3 directory levels
+    #     deep under /root/, where every path component — the three
+    #     directory names and the binary's own filename — is a short
+    #     random-looking lowercase-alphanumeric string. Found live on
+    #     oddify 2026-08-20: /root/7edt9p0r/82rmgq1a/f6sp7qig/swjeh6qoc970,
+    #     72% CPU, running undetected for 7+ hours (since 09:43, first
+    #     noticed at 16:48) across 14+ periodic report-mode scans in that
+    #     window — none of them flagged it. This is the exact gap already
+    #     called out in memory after the first sighting of this pattern
+    #     (x5lw39qmi9wu under /root/njpho4na/umn5cagm/ecbnd3fh/) but never
+    #     turned into a check: not a dotfile (hidden-exe-process doesn't
+    #     apply), not in /tmp/var-tmp (tmp-exec doesn't apply), not a known
+    #     filename (known-loader-file doesn't apply). The case arms above
+    #     already handle the two locations no legitimate binary ever runs
+    #     from at all (tmp, doc dirs); this one instead leans on structure,
+    #     since deep, meaningless-named subdirectories under /root/ are
+    #     never how a real install or deploy lays out its files (those use
+    #     dotfile config dirs like .npm/.cargo/.pm2, or a project name, not
+    #     three consecutive 6-14 char random strings). Scoped tightly (all
+    #     four path segments must match the random-string shape) precisely
+    #     to avoid catching something like /root/my-app/dist/bin/server.
+    #     Already gated on CPU_THRESHOLD like every other check in this
+    #     block, so a merely-present but idle binary here is not flagged.
+    if [[ "$exe" =~ ^/root/[a-z0-9]{5,14}/[a-z0-9]{5,14}/[a-z0-9]{5,14}/[a-z0-9]{5,14}$ ]]; then
+      record "nested-random-dir-highcpu" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+      capture_forensics "$pid" "nested-random-dir-highcpu"
+      if [ "$KILL" = 1 ]; then
+        kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+        top_dir=$(echo "$exe" | awk -F/ '{print "/root/"$3}')
+        [ -d "$top_dir" ] && rm -rf "$top_dir" && say "  removed: $top_dir"
+      fi
+    fi
   done < <(ps -e -o pid=,%cpu=,comm= | awk -v t="$CPU_THRESHOLD" '$2+0 > t {print $1, $2, $3}')
 else
   say "  skipped (ps/awk not available)"
