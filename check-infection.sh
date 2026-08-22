@@ -194,9 +194,37 @@ say "=== linux-cryptojack-hunter v$VERSION - $(hostname) - $(date) ==="
 #    takes more than a few seconds risks losing this exact race. Clearing
 #    the cron-based persistence before touching the process closes it.
 say "Checking crontabs and /etc/cron.d..."
+# Shared shape for "cron line directly executes a hidden dotfile binary from
+# a known drop location" — same idea as the hidden-exe-process process check
+# below, just matched against cron content instead of /proc/PID/exe. Scoped
+# to a fixed set of drop directories and a pure-alnum 5-14 char name (no
+# underscore/hyphen) to stay clear of legitimate dotfiles a real cron job
+# might reference (.bashrc, .bash_profile, .npmrc, a project's .venv/bin/...
+# all fail this on either the character class or the trailing boundary).
+HIDDEN_DOTFILE_EXEC_RE='(^|[[:space:]])(/root|/home/[^/[:space:]]+|/tmp|/var/tmp|/dev/shm)/\.[a-z0-9]{5,14}([[:space:]]|$)'
+# The path shape alone isn't enough: a completely ordinary line like
+# `source /home/deploy/.npmrc` matches it too (npmrc is 5 lowercase-alnum
+# chars, immediately followed by end-of-line), and dotfiles genuinely named
+# like real config files is exactly what this campaign is going for. The
+# distinguishing signal is EXECUTABLE position — the path is the command
+# being run, not an argument something else reads — so any line that also
+# contains a referencing keyword (source/export/test/the `[` test builtin)
+# is treated as an ordinary reference and skipped, even though the bare path
+# shape matched. Checked per-line rather than against the whole multi-line
+# block so one legitimate `source ~/.npmrc`-style line elsewhere in the same
+# crontab/rc file can't shadow a real hit sitting on a different line.
+is_hidden_dotfile_exec() {
+  local content="$1" line
+  while IFS= read -r line; do
+    echo "$line" | grep -qE "$HIDDEN_DOTFILE_EXEC_RE" || continue
+    echo "$line" | grep -qE '(^|[[:space:]])(source|export|test|\[)[[:space:]]' && continue
+    return 0
+  done <<< "$content"
+  return 1
+}
 check_cron_content() {
   local label="$1" content="$2"
-  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0
+  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0 hidden_dotfile_hit=0
   local decoded combined
   decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
     echo "$b64" | base64 -d 2>/dev/null
@@ -238,11 +266,25 @@ $decoded"
   for name in "${KNOWN_LOADER_FILES[@]}"; do
     echo "$combined" | grep -qE "(^|[/[:space:]])\.?${name}([[:space:]]|\$)" && loader_hit=1
   done
+  # Bare "run this hidden dotfile every minute" persistence, no watchdog
+  # probe and no domain/IP in the line itself — the malware picks a fresh
+  # random name each infection cycle, so it never matches KNOWN_LOADER_FILES
+  # either. Found live on oddify 2026-08-22 as `* * * * * /root/.njedkyhlbjba`
+  # (and a second copy with ` --guard` appended) in both root's own crontab
+  # and a freshly-dropped /etc/cron.d/systemd-udevd — sitting alongside a
+  # still-live .systemd-guard.service (Restart=always) that was the actual
+  # sub-3-second respawn source; this cron entry was simply the second,
+  # independent leg of the same persistence and would have kept the campaign
+  # alive on its own even after the systemd unit was removed. A legitimate
+  # cron entry does not invoke a hidden dotfile straight out of /root,
+  # /home/*, /tmp, /var/tmp, or /dev/shm, so this is CONFIRMED on its own.
+  is_hidden_dotfile_exec "$combined" && hidden_dotfile_hit=1
 
-  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ]; then
+  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ] || [ "$hidden_dotfile_hit" = 1 ]; then
     local check="cron-dropper"
-    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && check="cron-watchdog"
-    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && check="cron-loader-persistence"
+    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && check="cron-watchdog"
+    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && check="cron-loader-persistence"
+    [ "$hidden_dotfile_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && check="cron-hidden-dotfile-exec"
     record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
     return 0
   fi
@@ -284,6 +326,14 @@ $decoded"
   for name in "${KNOWN_LOADER_FILES[@]}"; do
     echo "$combined" | grep -qE "(^|[/[:space:]])\.?${name}([[:space:]]|\$)" && return 0
   done
+  # Kept in sync with the hidden-dotfile-exec check in check_cron_content
+  # above — same gap it closes (a bare per-minute hidden-dotfile launch with
+  # no watchdog probe, no domain, and a name that changes every cycle), same
+  # reason it has to live here too: without it, a surgical --kill rebuild of
+  # a mixed crontab would flag the whole crontab as malicious up in
+  # check_cron_content but then silently KEEP this exact line when rebuilding
+  # the "cleaned" file line-by-line.
+  is_hidden_dotfile_exec "$combined" && return 0
   return 1
 }
 if has crontab; then
@@ -313,6 +363,108 @@ for f in /etc/cron.d/*; do
     [ "$KILL" = 1 ] && safe_remove "$f" && say "  removed: $f"
   fi
 done
+
+# 0b) The same hidden-dotfile persistence as above, but launched from a
+#     login hook instead of cron: a dedicated /etc/profile.d/*.sh (system-
+#     wide, runs for every login shell) or a line appended straight to
+#     /etc/profile, /etc/bash.bashrc, or a user's own ~/.bashrc / ~/.profile
+#     / ~/.bash_profile. Found live on oddify 2026-08-22 as
+#     /etc/profile.d/systemd-udevd.sh:
+#       if [ -z "$SYSTEMD_UDEV_STARTED" ]; then
+#           export SYSTEMD_UDEV_STARTED=1
+#           /root/.njedkyhlbjba &
+#       fi
+#     plus stale `nohup /root/.<hash> >/dev/null 2>&1 &` lines appended to
+#     both /root/.bashrc and /root/.profile from earlier infection cycles.
+#     None of this was ever covered — every existing check here looks at
+#     processes, systemd units, or cron, never at what a fresh shell/login
+#     sources. A dedicated profile.d file matching this shape is deleted
+#     outright (same treatment as a cron.d drop); the shared system files and
+#     personal rc files are never deleted, only the matching line(s) stripped
+#     out, since a real box's /etc/profile or a user's .bashrc is not
+#     self-contained the way a dropped profile.d snippet or cron.d file is.
+say "Checking for hidden-dotfile persistence in profile.d and shell rc files..."
+strip_hidden_dotfile_lines() {
+  local f="$1" hits keep tmp
+  [ -f "$f" ] || return 1
+  is_hidden_dotfile_exec "$(cat "$f" 2>/dev/null)" || return 1
+  hits=$(while IFS= read -r line; do
+    is_hidden_dotfile_exec "$line" && printf '%s\n' "$line"
+  done < "$f")
+  record "shell-rc-hidden-dotfile-backdoor" "confirmed" "$f: $(echo "$hits" | tr '\n' ';')"
+  if [ "$KILL" = 1 ]; then
+    keep=$(while IFS= read -r line; do
+      is_hidden_dotfile_exec "$line" || printf '%s\n' "$line"
+    done < "$f")
+    tmp=$(mktemp)
+    printf '%s\n' "$keep" > "$tmp" && cat "$tmp" > "$f"
+    rm -f "$tmp"
+    say "  removed malicious line(s) from: $f"
+  fi
+  return 0
+}
+for f in /etc/profile.d/*.sh; do
+  [ -f "$f" ] || continue
+  is_hidden_dotfile_exec "$(cat "$f" 2>/dev/null)" || continue
+  record "profile.d-hidden-dotfile-backdoor" "confirmed" "$f: $(tr '\n' ';' < "$f")"
+  [ "$KILL" = 1 ] && safe_remove "$f" && say "  removed: $f"
+done
+strip_hidden_dotfile_lines /etc/profile
+strip_hidden_dotfile_lines /etc/bash.bashrc
+for home in /root /home/*; do
+  [ -d "$home" ] || continue
+  strip_hidden_dotfile_lines "$home/.bashrc"
+  strip_hidden_dotfile_lines "$home/.profile"
+  strip_hidden_dotfile_lines "$home/.bash_profile"
+done
+
+# 0c) Mass-flood of identical decoy payloads dropped under /tmp: dozens of
+#     copies of the exact same executable, scattered under legitimate-
+#     sounding names (.bashrc25, .vimrc, .gitconfig, .cache.db, ...) and
+#     inside dozens of fake directories named after real kernel threads and
+#     daemons (.mongod, .redis-server, .sshd, .kworker, .rcu, .jbd2, ...).
+#     Found live on oddify 2026-08-22: 77 byte-for-byte identical copies of a
+#     5,496,348-byte statically-linked ELF (md5 287d083e42452e36cf3a6e473d251a5c
+#     — the same binary that was actively running as that cycle's guard/loader
+#     process) filled /tmp's 476M tmpfs to 100% on its own. No process needs
+#     to be running from any of these for them to already be actively
+#     harmful: as pure tmpfs exhaustion they can silently break anything else
+#     on the box that writes to /tmp (a `next build` here failed outright
+#     with "No space left on device"), and every copy left behind is a ready
+#     spare in case the running instance gets killed. Detection stays
+#     hash-based rather than name/path-based on purpose — the decoy names and
+#     directory names are trivial for the next cycle to change, but 5+ byte-
+#     for-byte identical *executable* files is not something any legitimate
+#     workload produces under /tmp.
+say "Checking for a mass-flood of identical decoy payloads under /tmp..."
+if has find && has md5sum; then
+  tmp_hash_list=$(find /tmp -maxdepth 6 -type f -size +100k -perm -u+x 2>/dev/null | while read -r f; do
+    h=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$h" ] && echo "$h $f"
+  done)
+  if [ -n "$tmp_hash_list" ]; then
+    echo "$tmp_hash_list" | awk '{print $1}' | sort | uniq -c | sort -rn | while read -r cnt hash; do
+      [ "$cnt" -ge 5 ] || continue
+      sample=$(echo "$tmp_hash_list" | awk -v h="$hash" '$1==h{print $2; exit}')
+      size=$(stat -c '%s' "$sample" 2>/dev/null)
+      record "tmp-mass-payload-flood" "confirmed" "md5=$hash size=${size}b count=$cnt sample=$sample"
+      if [ "$KILL" = 1 ]; then
+        echo "$tmp_hash_list" | awk -v h="$hash" '$1==h{ $1=""; sub(/^ /,""); print }' | while read -r f; do
+          safe_remove "$f" && say "  removed: $f"
+        done
+      fi
+    done
+  fi
+  if [ "$KILL" = 1 ]; then
+    find /tmp -mindepth 1 -maxdepth 1 -type d -empty \
+      ! -name '.X11-unix' ! -name '.ICE-unix' ! -name '.XIM-unix' \
+      ! -name '.font-unix' ! -name '.NetworkManager' \
+      ! -name 'snap-private-tmp' ! -name 'systemd-private-*' \
+      -exec rmdir {} \; 2>/dev/null
+  fi
+else
+  say "  skipped (find/md5sum unavailable)"
+fi
 
 # 1) High-CPU process running from /tmp or /var/tmp. The attacker renames
 #    this binary every time (cpu-logind, dashboard, and whatever comes
