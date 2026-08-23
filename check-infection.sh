@@ -935,7 +935,7 @@ for d in /proc/[0-9]*; do
     esac
   done
   [ "$is_interp" = 1 ] || continue
-  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
   [ -z "$cmd" ] && continue
   script=$(echo "$cmd" | grep -oE '(^| )(/tmp|/var/tmp)/[^ ]+' | head -1 | sed 's/^ //')
   [ -n "$script" ] && [ -f "$script" ] || continue
@@ -971,7 +971,7 @@ say "Checking all process command lines for a cryptominer flag signature..."
 miner_re=$(IFS='|'; echo "${MINER_CMDLINE_PATTERNS[*]}")
 for d in /proc/[0-9]*; do
   pid=${d##*/}
-  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
   [ -z "$cmd" ] && continue
   echo "$cmd" | grep -qE "$miner_re" || continue
   exe=$(readlink -f "$d/exe" 2>/dev/null)
