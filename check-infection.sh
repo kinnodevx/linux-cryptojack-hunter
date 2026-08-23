@@ -466,24 +466,31 @@ else
   say "  skipped (find/md5sum unavailable)"
 fi
 
-# 1) High-CPU process running from /tmp or /var/tmp. The attacker renames
-#    this binary every time (cpu-logind, dashboard, and whatever comes
-#    next), specifically to dodge exact-name matching like
-#    KNOWN_LOADER_FILES. A high-CPU process whose own backing binary lives
-#    in /tmp or /var/tmp is confirmed malicious regardless of what it is
-#    named, so --kill now also removes that exact backing file, not just
-#    the process. Before this, killing the process left the binary itself
-#    on disk under --kill (seen live on oddify: cpu-logind survived one
-#    remediation pass this way, then again hours later as /tmp/dashboard,
+# 1) High-CPU (or, since 2026-08-23, high-memory) process running from /tmp
+#    or /var/tmp. The attacker renames this binary every time (cpu-logind,
+#    dashboard, and whatever comes next), specifically to dodge exact-name
+#    matching like KNOWN_LOADER_FILES. A high-CPU process whose own backing
+#    binary lives in /tmp or /var/tmp is confirmed malicious regardless of
+#    what it is named, so --kill now also removes that exact backing file,
+#    not just the process. Before this, killing the process left the binary
+#    itself on disk under --kill (seen live on oddify: cpu-logind survived
+#    one remediation pass this way, then again hours later as /tmp/dashboard,
 #    same 8350992-byte binary, new name, still not deleted by any check).
-say "Checking for high-CPU processes running from /tmp or /var/tmp..."
+#
+#    The candidate list now also admits high-%mem processes (MEM_THRESHOLD),
+#    not just high-%cpu ones — see iocs.conf comment for the live incident
+#    (a nested-random-dir master loop at 27% mem / 36% cpu that dodged
+#    CPU_THRESHOLD=40 for 1h40min+). This only widens which PIDs get
+#    inspected below; the structural match per case arm still gates what
+#    actually gets recorded as a finding, so it does not loosen confirmation.
+say "Checking for high-CPU/high-mem processes running from /tmp or /var/tmp..."
 if has ps && has awk; then
-  while read -r pid cpu comm; do
+  while read -r pid cpu mem comm; do
     [ -z "$pid" ] && continue
     exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
     case "$exe" in
       /tmp/*|/var/tmp/*)
-        record "tmp-exec" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+        record "tmp-exec" "confirmed" "pid=$pid cpu=${cpu}% mem=${mem}% comm=$comm exe=$exe"
         capture_forensics "$pid" "tmp-exec"
         if [ "$KILL" = 1 ]; then
           kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
@@ -508,7 +515,7 @@ if has ps && has awk; then
         # etc. are completely normal per-user install locations. Scoping to
         # specific directories that can never legitimately hold an
         # executable is the safe version of the same idea.
-        record "doc-dir-exec" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+        record "doc-dir-exec" "confirmed" "pid=$pid cpu=${cpu}% mem=${mem}% comm=$comm exe=$exe"
         capture_forensics "$pid" "doc-dir-exec"
         if [ "$KILL" = 1 ]; then
           kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
@@ -537,10 +544,11 @@ if has ps && has awk; then
     #     three consecutive 6-14 char random strings). Scoped tightly (all
     #     four path segments must match the random-string shape) precisely
     #     to avoid catching something like /root/my-app/dist/bin/server.
-    #     Already gated on CPU_THRESHOLD like every other check in this
-    #     block, so a merely-present but idle binary here is not flagged.
+    #     Already gated on CPU_THRESHOLD (or, since 2026-08-23, MEM_THRESHOLD)
+    #     like every other check in this block, so a merely-present but idle
+    #     binary here is not flagged.
     if [[ "$exe" =~ ^/root/[a-z0-9]{5,14}/[a-z0-9]{5,14}/[a-z0-9]{5,14}/[a-z0-9]{5,14}$ ]]; then
-      record "nested-random-dir-highcpu" "confirmed" "pid=$pid cpu=${cpu}% comm=$comm exe=$exe"
+      record "nested-random-dir-highcpu" "confirmed" "pid=$pid cpu=${cpu}% mem=${mem}% comm=$comm exe=$exe"
       capture_forensics "$pid" "nested-random-dir-highcpu"
       if [ "$KILL" = 1 ]; then
         kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
@@ -548,7 +556,7 @@ if has ps && has awk; then
         [ -d "$top_dir" ] && rm -rf "$top_dir" && say "  removed: $top_dir"
       fi
     fi
-  done < <(ps -e -o pid=,%cpu=,comm= | awk -v t="$CPU_THRESHOLD" '$2+0 > t {print $1, $2, $3}')
+  done < <(ps -e -o pid=,%cpu=,%mem=,comm= | awk -v ct="$CPU_THRESHOLD" -v mt="$MEM_THRESHOLD" '($2+0 > ct) || ($3+0 > mt) {print $1, $2, $3, $4}')
 else
   say "  skipped (ps/awk not available)"
 fi
