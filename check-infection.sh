@@ -896,6 +896,95 @@ for d in /proc/[0-9]*; do
   esac
 done
 
+# 1i) An interpreter (node/python/perl/php/...) running a script file that
+#     lives under /tmp or /var/tmp. Found live on oddify 2026-08-23:
+#     `node /var/tmp/.systemd/wd.js`, a watchdog that spawned an XMRig
+#     binary renamed to a plausible-looking `boltd_r9`, restarted it every
+#     20s if missing, and additionally SIGSTOPped the miner (freezing its
+#     CPU use to zero) whenever `w`/`who` showed a logged-in tty/pts session
+#     — resuming it with SIGCONT once no admin appeared to be watching. It
+#     ran undetected for 5+ hours across dozens of periodic scans because
+#     every existing process-identity check resolves /proc/PID/exe, and for
+#     an interpreted script that is always the legitimate interpreter binary
+#     (/usr/bin/node here) — the actual payload is only visible in argv.
+#     Checked here as its own class rather than folded into the hidden-
+#     dotfile-exec check above because the drop directory does not have to
+#     be a dotfile itself (a plain /tmp/foo/run.js would be just as exec'able
+#     from the shell but would not match that check at all); /tmp and
+#     /var/tmp are, same as check 1, never a legitimate place to run a
+#     persistent script from regardless of naming.
+say "Checking for an interpreter running a script from /tmp or /var/tmp..."
+for d in /proc/[0-9]*; do
+  pid=${d##*/}
+  exe=$(readlink -f "$d/exe" 2>/dev/null) || continue
+  base=$(basename "$exe")
+  is_interp=0
+  for i in "${INTERPRETER_BASENAMES[@]}"; do
+    # Match the bare name or a version-suffixed one (node-20, python3.11,
+    # php8.2, ...), not a plain prefix: /proc/PID/exe for a process started
+    # via the generic `node`/`python3`/`php` symlink resolves to whatever
+    # real versioned binary the distro or a version manager actually
+    # installed, never the bare name, so an exact-match list would silently
+    # miss almost every real install. A plain prefix match would be too
+    # loose the other way — it would also catch an unrelated binary like
+    # Prometheus's `node_exporter`, which is a common thing to find
+    # legitimately running on a server and takes no /tmp-path argument
+    # this check would ever see, but there is no reason to rely on that.
+    case "$base" in
+      "$i"|"$i".*|"$i"-*|"$i"[0-9]*) is_interp=1; break ;;
+    esac
+  done
+  [ "$is_interp" = 1 ] || continue
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  [ -z "$cmd" ] && continue
+  script=$(echo "$cmd" | grep -oE '(^| )(/tmp|/var/tmp)/[^ ]+' | head -1 | sed 's/^ //')
+  [ -n "$script" ] && [ -f "$script" ] || continue
+  record "interpreter-script-in-tmp" "confirmed" "pid=$pid interpreter=$exe script=$script cmd=$cmd"
+  capture_forensics "$pid" "interpreter-script-in-tmp"
+  if [ "$KILL" = 1 ]; then
+    kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+    sdir=$(dirname "$script")
+    if [ "$sdir" != "/tmp" ] && [ "$sdir" != "/var/tmp" ] && [ -d "$sdir" ]; then
+      rm -rf "$sdir" && say "  removed: $sdir"
+    else
+      safe_remove "$script" && say "  removed: $script"
+    fi
+  fi
+done
+
+# 1j) Any process, running or paused, whose full command line carries an
+#     XMRig-family flag signature (--donate-level, --randomx-mode, a -o/-u
+#     pool+wallet pair, or a stratum+tcp/stratum+ssl URL). Unlike every
+#     other check in this script, this one is intentionally NOT gated on
+#     %cpu/%mem or on the backing binary's name or path: the live incident
+#     this was written for (the boltd_r9 miner spawned by the watchdog in
+#     1i) is deliberately SIGSTOPped by its own watchdog whenever a login
+#     session is detected, so at exactly the moment a human (or this
+#     script, if run over an interactive tty) goes looking, `ps` shows 0%
+#     CPU and the process is otherwise indistinguishable from anything
+#     else idling. A stopped process's /proc/PID/cmdline is still fully
+#     readable, so reading it directly (same reasoning as 1d-iii above)
+#     catches the miner in exactly the state its own evasion logic is
+#     designed to hide it in. These flags are essentially unique to the
+#     XMRig family; no legitimate service on a webapp/API host uses them.
+say "Checking all process command lines for a cryptominer flag signature..."
+miner_re=$(IFS='|'; echo "${MINER_CMDLINE_PATTERNS[*]}")
+for d in /proc/[0-9]*; do
+  pid=${d##*/}
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  [ -z "$cmd" ] && continue
+  echo "$cmd" | grep -qE "$miner_re" || continue
+  exe=$(readlink -f "$d/exe" 2>/dev/null)
+  record "miner-cmdline-signature" "confirmed" "pid=$pid exe=${exe:-?} cmd=$cmd"
+  capture_forensics "$pid" "miner-cmdline-signature"
+  if [ "$KILL" = 1 ]; then
+    kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+    case "$exe" in
+      /tmp/*|/var/tmp/*) safe_remove "$exe" && say "  removed: $exe" ;;
+    esac
+  fi
+done
+
 # 2) Network connections to a known C2 IP.
 say "Checking network connections to known C2 IPs..."
 if has ss; then
