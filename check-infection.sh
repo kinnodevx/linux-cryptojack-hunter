@@ -123,6 +123,20 @@ safe_remove() {
   rm -f "$path"
 }
 
+# Same idea for a payload directory: any file inside can carry +i on its
+# own, and a single immutable file makes `rm -rf` fail on that one entry
+# and leave the directory (and everything in it) behind — the rest of the
+# tree still gets deleted since `rm -rf` presses on past one error, but the
+# immutable survivor is exactly the binary worth keeping gone. Caught live
+# on apostacertabet 2026-08-24: `rm -rf /root/moneroocean` left
+# `xmrig` itself sitting on disk (chattr +i'd) after the unit was already
+# stopped/disabled/deleted.
+safe_rmdir() {
+  local dir="$1"
+  has chattr && chattr -R -i -a "$dir" 2>/dev/null
+  rm -rf "$dir"
+}
+
 # Forensics for a CONFIRMED malicious process: full parent chain up to init,
 # plus the most recent web-server access-log lines, appended to a standing
 # log file. Every check in this script so far only ever answered "what is
@@ -224,7 +238,7 @@ is_hidden_dotfile_exec() {
 }
 check_cron_content() {
   local label="$1" content="$2"
-  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0 hidden_dotfile_hit=0
+  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0 hidden_dotfile_hit=0 backdoor_user_hit=0
   local decoded combined
   decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
     echo "$b64" | base64 -d 2>/dev/null
@@ -279,12 +293,28 @@ $decoded"
   # cron entry does not invoke a hidden dotfile straight out of /root,
   # /home/*, /tmp, /var/tmp, or /dev/shm, so this is CONFIRMED on its own.
   is_hidden_dotfile_exec "$combined" && hidden_dotfile_hit=1
+  # Recurring cron-based backdoor-user creation: idempotently (re)creates a
+  # local user, sets its password non-interactively via chpasswd, and grants
+  # it passwordless root via a sudoers.d drop-in. No domain/IP, no fetch, no
+  # known loader filename in the line itself, so none of the checks above
+  # ever fire on it — found live on apostacertabet 2026-08-24 as a
+  # `*/30 * * * * (id pakchoi >/dev/null 2>&1 || (useradd ...; ... | chpasswd;
+  # echo '... ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/...))` line that kept
+  # recreating the 'pakchoi' backdoor user every 30 minutes even after the
+  # user account itself was deleted by the known-backdoor-user check, because
+  # the surgical per-line crontab rebuild (cron_line_is_malicious below) had
+  # no signature for it and kept the line as "legitimate". A real cron job
+  # essentially never combines user creation, a piped chpasswd, and a
+  # NOPASSWD sudoers grant in one shot, so this is CONFIRMED on its own,
+  # regardless of which username it targets.
+  echo "$combined" | grep -qE 'useradd\b' && echo "$combined" | grep -qE '\bchpasswd\b' && echo "$combined" | grep -qE 'NOPASSWD:ALL' && backdoor_user_hit=1
 
-  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ] || [ "$hidden_dotfile_hit" = 1 ]; then
+  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ] || [ "$hidden_dotfile_hit" = 1 ] || [ "$backdoor_user_hit" = 1 ]; then
     local check="cron-dropper"
-    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && check="cron-watchdog"
-    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && check="cron-loader-persistence"
-    [ "$hidden_dotfile_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && check="cron-hidden-dotfile-exec"
+    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-watchdog"
+    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-loader-persistence"
+    [ "$hidden_dotfile_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-hidden-dotfile-exec"
+    [ "$backdoor_user_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && check="cron-backdoor-user-creation"
     record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
     return 0
   fi
@@ -334,6 +364,13 @@ $decoded"
   # check_cron_content but then silently KEEP this exact line when rebuilding
   # the "cleaned" file line-by-line.
   is_hidden_dotfile_exec "$combined" && return 0
+  # Kept in sync with the cron-backdoor-user-creation signature in
+  # check_cron_content above, same reason as the other three: without it, a
+  # surgical --kill rebuild would correctly flag the whole crontab CONFIRMED
+  # (because some other line in it tripped one of the checks above) but then
+  # keep this exact line as "legitimate", letting the backdoor user get
+  # recreated on its own 30-minute schedule right after the cleanup.
+  echo "$combined" | grep -qE 'useradd\b' && echo "$combined" | grep -qE '\bchpasswd\b' && echo "$combined" | grep -qE 'NOPASSWD:ALL' && return 0
   return 1
 }
 if has crontab; then
@@ -443,17 +480,17 @@ if has find && has md5sum; then
     [ -n "$h" ] && echo "$h $f"
   done)
   if [ -n "$tmp_hash_list" ]; then
-    echo "$tmp_hash_list" | awk '{print $1}' | sort | uniq -c | sort -rn | while read -r cnt hash; do
+    while read -r cnt hash; do
       [ "$cnt" -ge 5 ] || continue
       sample=$(echo "$tmp_hash_list" | awk -v h="$hash" '$1==h{print $2; exit}')
       size=$(stat -c '%s' "$sample" 2>/dev/null)
       record "tmp-mass-payload-flood" "confirmed" "md5=$hash size=${size}b count=$cnt sample=$sample"
       if [ "$KILL" = 1 ]; then
-        echo "$tmp_hash_list" | awk -v h="$hash" '$1==h{ $1=""; sub(/^ /,""); print }' | while read -r f; do
+        while read -r f; do
           safe_remove "$f" && say "  removed: $f"
-        done
+        done < <(echo "$tmp_hash_list" | awk -v h="$hash" '$1==h{ $1=""; sub(/^ /,""); print }')
       fi
-    done
+    done < <(echo "$tmp_hash_list" | awk '{print $1}' | sort | uniq -c | sort -rn)
   fi
   if [ "$KILL" = 1 ]; then
     find /tmp -mindepth 1 -maxdepth 1 -type d -empty \
@@ -553,7 +590,7 @@ if has ps && has awk; then
       if [ "$KILL" = 1 ]; then
         kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
         top_dir=$(echo "$exe" | awk -F/ '{print "/root/"$3}')
-        [ -d "$top_dir" ] && rm -rf "$top_dir" && say "  removed: $top_dir"
+        [ -d "$top_dir" ] && safe_rmdir "$top_dir" && say "  removed: $top_dir"
       fi
     fi
   done < <(ps -e -o pid=,%cpu=,%mem=,comm= | awk -v ct="$CPU_THRESHOLD" -v mt="$MEM_THRESHOLD" '($2+0 > ct) || ($3+0 > mt) {print $1, $2, $3, $4}')
@@ -844,7 +881,7 @@ for d in /proc/[0-9]*; do
             # Versioned install dir (xmrig-6.21.0/ etc) belongs to the
             # miner, not the host app — safe to remove entirely, same as
             # miner-systemd-unit's install-directory cleanup below.
-            rm -rf "$parent_dir" && say "  removed: $parent_dir"
+            safe_rmdir "$parent_dir" && say "  removed: $parent_dir"
             ;;
           *)
             # Parent dir doesn't look miner-specific (could be the app's
@@ -945,7 +982,7 @@ for d in /proc/[0-9]*; do
     kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
     sdir=$(dirname "$script")
     if [ "$sdir" != "/tmp" ] && [ "$sdir" != "/var/tmp" ] && [ -d "$sdir" ]; then
-      rm -rf "$sdir" && say "  removed: $sdir"
+      safe_rmdir "$sdir" && say "  removed: $sdir"
     else
       safe_remove "$script" && say "  removed: $script"
     fi
@@ -1191,7 +1228,7 @@ if has systemctl; then
         case "$exec_target" in
           /root/*|/tmp/*|/var/tmp/*|/home/*|/opt/*)
             payload_dir=$(dirname "$exec_target")
-            [ -d "$payload_dir" ] && rm -rf "$payload_dir" && say "  removed payload directory: $payload_dir"
+            [ -d "$payload_dir" ] && safe_rmdir "$payload_dir" && say "  removed payload directory: $payload_dir"
             ;;
         esac
         # Without this, systemd keeps the unit "Loaded" from its in-memory
@@ -1255,7 +1292,7 @@ if has systemctl; then
         # kill that only stops the process/unit but leaves the payload on
         # disk means the next reboot (or a stray `systemctl start`) brings
         # it right back with nothing left to re-download.
-        [ -n "$target" ] && [ -d "$(dirname "$target")" ] && rm -rf "$(dirname "$target")" && say "  removed: $(dirname "$target")"
+        [ -n "$target" ] && [ -d "$(dirname "$target")" ] && safe_rmdir "$(dirname "$target")" && say "  removed: $(dirname "$target")"
         systemctl daemon-reload 2>/dev/null
         systemctl reset-failed "$unit_name.service" 2>/dev/null
         say "  stopped/disabled/removed: $unit_name"
