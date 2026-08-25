@@ -573,52 +573,62 @@ if has ps && has awk; then
         fi
         ;;
     esac
-    # 1a-iii) High-CPU process backed by a binary buried 2-3 directory levels
-    #     deep under /root/, where every path component — the directory
-    #     names and the binary's own filename — is a short random-looking
-    #     lowercase-alphanumeric string. Found live on oddify 2026-08-20:
-    #     /root/7edt9p0r/82rmgq1a/f6sp7qig/swjeh6qoc970, 72% CPU, running
-    #     undetected for 7+ hours (since 09:43, first noticed at 16:48)
-    #     across 14+ periodic report-mode scans in that window — none of
-    #     them flagged it. This is the exact gap already called out in
-    #     memory after the first sighting of this pattern (x5lw39qmi9wu
-    #     under /root/njpho4na/umn5cagm/ecbnd3fh/) but never turned into a
-    #     check: not a dotfile (hidden-exe-process doesn't apply), not in
-    #     /tmp/var-tmp (tmp-exec doesn't apply), not a known filename
-    #     (known-loader-file doesn't apply). The case arms above already
-    #     handle the two locations no legitimate binary ever runs from at
-    #     all (tmp, doc dirs); this one instead leans on structure, since
-    #     deep, meaningless-named subdirectories under /root/ are never how
-    #     a real install or deploy lays out its files (those use dotfile
-    #     config dirs like .npm/.cargo/.pm2, or a project name, not
-    #     consecutive 5-14 char random strings). Scoped tightly (every path
-    #     segment must match the random-string shape) precisely to avoid
-    #     catching something like /root/my-app/dist/bin/server. Already
-    #     gated on CPU_THRESHOLD (or, since 2026-08-23, MEM_THRESHOLD) like
-    #     every other check in this block, so a merely-present but idle
-    #     binary here is not flagged.
-    #
-    #     The real incident this widened for (oddify 2026-08-25) turned out
-    #     to be the readlink -f / empty-$exe bug fixed above, not a depth
-    #     mismatch — that binary was the usual 3 levels deep. Widened to also
-    #     accept 2 directory levels anyway as cheap future-proofing against
-    #     the depth changing, now that a self-deleted exe's " (deleted)"
-    #     suffix (stripped below before the shape check) no longer needs
-    #     `-f` to resolve and so no longer goes silently empty.
-    exe_shape="${exe% (deleted)}"
-    if [[ "$exe_shape" =~ ^/root/[a-z0-9]{5,14}/[a-z0-9]{5,14}/[a-z0-9]{5,14}(/[a-z0-9]{5,14})?$ ]]; then
-      record "nested-random-dir-highcpu" "confirmed" "pid=$pid cpu=${cpu}% mem=${mem}% comm=$comm exe=$exe"
-      capture_forensics "$pid" "nested-random-dir-highcpu"
-      if [ "$KILL" = 1 ]; then
-        kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
-        top_dir=$(echo "$exe_shape" | awk -F/ '{print "/root/"$3}')
-        [ -d "$top_dir" ] && safe_rmdir "$top_dir" && say "  removed: $top_dir"
-      fi
-    fi
   done < <(ps -e -o pid=,%cpu=,%mem=,comm= | awk -v ct="$CPU_THRESHOLD" -v mt="$MEM_THRESHOLD" '($2+0 > ct) || ($3+0 > mt) {print $1, $2, $3, $4}')
 else
   say "  skipped (ps/awk not available)"
 fi
+
+# 1a-iii) Process backed by a binary buried 2-3 directory levels deep under
+#     /root/, where every path component — the directory names and the
+#     binary's own filename — is a short random-looking lowercase-
+#     alphanumeric string. Found live on oddify 2026-08-20:
+#     /root/7edt9p0r/82rmgq1a/f6sp7qig/swjeh6qoc970, 72% CPU, running
+#     undetected for 7+ hours (since 09:43, first noticed at 16:48) across
+#     14+ periodic report-mode scans in that window — none of them flagged
+#     it. This is the exact gap already called out in memory after the
+#     first sighting of this pattern (x5lw39qmi9wu under
+#     /root/njpho4na/umn5cagm/ecbnd3fh/) but never turned into a check: not
+#     a dotfile (hidden-exe-process doesn't apply), not in /tmp/var-tmp
+#     (tmp-exec doesn't apply), not a known filename (known-loader-file
+#     doesn't apply). This leans on structure alone, since deep,
+#     meaningless-named subdirectories under /root/ are never how a real
+#     install or deploy lays out its files (those use dotfile config dirs
+#     like .npm/.cargo/.pm2, or a project name, not consecutive 5-14 char
+#     random strings). Scoped tightly (every path segment must match the
+#     random-string shape) precisely to avoid catching something like
+#     /root/my-app/dist/bin/server.
+#
+#     Originally lived inside the CPU/mem-gated loop above (named
+#     nested-random-dir-highcpu) on the assumption that anything worth
+#     catching would be pegging a core. Found live on oddify 2026-08-25:
+#     an instance of this exact same campaign sitting at 17-24% CPU —
+#     under both CPU_THRESHOLD=40 and MEM_THRESHOLD=15 — running for 99+
+#     seconds straight through a full --kill pass with zero indicators
+#     tripped, simply because it stayed quiet. Its self-deleted binary also
+#     meant the orphaned-nested-random-dir sweep below couldn't see it
+#     either (that check requires the file to still exist on disk). Since
+#     the random-string shape is already trusted as safe on its own
+#     everywhere else it's used (no CPU/mem gate needed for correctness,
+#     only reused here for convenience originally), pulled out into its
+#     own unconditional scan of every running process instead — an idle or
+#     deliberately-throttled instance is just as much a confirmed hit as a
+#     CPU-pegging one.
+say "Checking every running process for the nested-random-dir payload structure under /root (no CPU/mem threshold — structure alone is enough)..."
+for d in /proc/[0-9]*; do
+  pid=${d##*/}
+  exe=$(readlink "$d/exe" 2>/dev/null) || continue
+  exe_shape="${exe% (deleted)}"
+  if [[ "$exe_shape" =~ ^/root/[a-z0-9]{5,14}/[a-z0-9]{5,14}/[a-z0-9]{5,14}(/[a-z0-9]{5,14})?$ ]]; then
+    comm=$(cat "$d/comm" 2>/dev/null)
+    capture_forensics "$pid" "nested-random-dir"
+    record "nested-random-dir" "confirmed" "pid=$pid comm=${comm:-?} exe=$exe (matched by directory structure alone, no cpu/mem threshold)"
+    if [ "$KILL" = 1 ]; then
+      kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+      top_dir=$(echo "$exe_shape" | awk -F/ '{print "/root/"$3}')
+      [ -d "$top_dir" ] && safe_rmdir "$top_dir" && say "  removed: $top_dir"
+    fi
+  fi
+done
 
 # 1a-iv) Orphaned nested-random-dir payload directories left behind after the
 #     process that owned them already died or was killed by 1a-iii above. The
