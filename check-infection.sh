@@ -1031,7 +1031,30 @@ if has ss; then
       record "c2-connection" "confirmed" "active connection to $ip: $(echo "$hits" | tr '\n' ';')"
       echo "$hits" | grep -oP 'pid=\K[0-9]+' | sort -u | while read -r pid; do
         capture_forensics "$pid" "c2-connection ($ip)"
-        [ "$KILL" = 1 ] && kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+        if [ "$KILL" = 1 ]; then
+          # Resolve the backing binary BEFORE killing — /proc/PID/exe stops
+          # resolving the instant the process dies. Caught live on oddify
+          # 2026-08-25: this block killed the C2-connected process every
+          # time but never touched its binary, so a second "md781" dropper
+          # (the same one first seen flooding /tmp under a different hash
+          # the cycle before) sat untouched at /root/.local/bin/md781 and
+          # /var/tmp/md781 through several kill+reverify cycles, dormant
+          # but ready to be relaunched by anything that still knew the
+          # path. A live C2-connected process is never legitimately backed
+          # by a binary under /root, /home, /opt, /tmp, or /var/tmp, so
+          # removing it here carries the same safety guarantee already
+          # used for the equivalent cleanup in miner-cmdline-signature
+          # above (which only trusted /tmp and /var/tmp) and in
+          # known-unit's payload-directory removal (which also trusts
+          # /root, /home, /opt).
+          exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
+          kill -9 "$pid" 2>/dev/null && say "  killed pid $pid"
+          case "$exe" in
+            /root/*|/home/*|/opt/*|/tmp/*|/var/tmp/*)
+              safe_remove "$exe" && say "  removed: $exe"
+              ;;
+          esac
+        fi
       done
     fi
   done
