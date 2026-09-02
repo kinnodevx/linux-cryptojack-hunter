@@ -29,7 +29,7 @@
 # human to look at.
 
 set -u
-VERSION="2.0.0"
+VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IOC_FILE="$SCRIPT_DIR/iocs.conf"
 KILL=0
@@ -216,6 +216,37 @@ say "Checking crontabs and /etc/cron.d..."
 # might reference (.bashrc, .bash_profile, .npmrc, a project's .venv/bin/...
 # all fail this on either the character class or the trailing boundary).
 HIDDEN_DOTFILE_EXEC_RE='(^|[[:space:]])(/root|/home/[^/[:space:]]+|/tmp|/var/tmp|/dev/shm)/\.[a-z0-9]{5,14}([[:space:]]|$)'
+# Same idea, one level deeper: instead of a hidden dotfile sitting directly
+# in the drop directory, the payload lives in an ordinary-named script INSIDE
+# a hidden subdirectory (e.g. /var/tmp/.system/wd.sh). HIDDEN_DOTFILE_EXEC_RE
+# above requires the hidden path component to be immediately followed by a
+# space/EOL, so a trailing "/wd.sh" makes it fail the boundary check and the
+# whole line reads as ordinary content. Found live on oddify 2026-09-01 as
+# `/etc/cron.d/sys-upd`: `*/2 * * * * root /bin/sh /var/tmp/.system/wd.sh` —
+# sitting there since 2026-08-26 (same day /usr/bin/dash was zeroed out and
+# chattr +i'd on the same box), completely undetected through many report
+# and --kill cycles because every other check in this function requires a
+# domain/IP, a liveness probe, a known loader filename, or useradd+chpasswd
+# in the line itself, and this line has none of those — it just quietly
+# re-dropped the entire infection (crontab, hidden processes, ld.so.preload,
+# systemd units) every couple of minutes once the rest of the payload was
+# killed, which is what made three same-day report-mode reverifies each come
+# back CONFIRMED again within ~26-30 minutes, then once within ~1 minute
+# right after a --kill. Scoped to /tmp, /var/tmp, /dev/shm only (not /root or
+# /home/*) because real prod cron jobs legitimately invoke scripts inside
+# hidden dirs there (.nvm, .cargo, .rbenv, .local/bin), whereas a persistent
+# hidden directory holding an app under a temp filesystem is not a pattern
+# any legitimate cron job needs.
+HIDDEN_DOTDIR_EXEC_RE='(^|[[:space:]])(/tmp|/var/tmp|/dev/shm)/\.[a-zA-Z0-9_-]{2,20}/[^[:space:]]+'
+is_hidden_dotdir_exec() {
+  local content="$1" line
+  while IFS= read -r line; do
+    echo "$line" | grep -qE "$HIDDEN_DOTDIR_EXEC_RE" || continue
+    echo "$line" | grep -qE '(^|[[:space:]])(source|export|test|\[)[[:space:]]' && continue
+    return 0
+  done <<< "$content"
+  return 1
+}
 # The path shape alone isn't enough: a completely ordinary line like
 # `source /home/deploy/.npmrc` matches it too (npmrc is 5 lowercase-alnum
 # chars, immediately followed by end-of-line), and dotfiles genuinely named
@@ -238,7 +269,7 @@ is_hidden_dotfile_exec() {
 }
 check_cron_content() {
   local label="$1" content="$2"
-  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0 hidden_dotfile_hit=0 backdoor_user_hit=0
+  local domain_hit=0 heuristic_hit=0 watchdog_hit=0 loader_hit=0 hidden_dotfile_hit=0 hidden_dotdir_hit=0 backdoor_user_hit=0
   local decoded combined
   decoded=$(echo "$content" | grep -oE '[A-Za-z0-9+/]{40,}={0,2}' | while read -r b64; do
     echo "$b64" | base64 -d 2>/dev/null
@@ -293,6 +324,9 @@ $decoded"
   # cron entry does not invoke a hidden dotfile straight out of /root,
   # /home/*, /tmp, /var/tmp, or /dev/shm, so this is CONFIRMED on its own.
   is_hidden_dotfile_exec "$combined" && hidden_dotfile_hit=1
+  # Same persistence, one path level deeper — see HIDDEN_DOTDIR_EXEC_RE above
+  # for the oddify 2026-09-01 incident this closes.
+  is_hidden_dotdir_exec "$combined" && hidden_dotdir_hit=1
   # Recurring cron-based backdoor-user creation: idempotently (re)creates a
   # local user, sets its password non-interactively via chpasswd, and grants
   # it passwordless root via a sudoers.d drop-in. No domain/IP, no fetch, no
@@ -309,12 +343,13 @@ $decoded"
   # regardless of which username it targets.
   echo "$combined" | grep -qE 'useradd\b' && echo "$combined" | grep -qE '\bchpasswd\b' && echo "$combined" | grep -qE 'NOPASSWD:ALL' && backdoor_user_hit=1
 
-  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ] || [ "$hidden_dotfile_hit" = 1 ] || [ "$backdoor_user_hit" = 1 ]; then
+  if [ "$domain_hit" = 1 ] || [ "$watchdog_hit" = 1 ] || [ "$loader_hit" = 1 ] || [ "$hidden_dotfile_hit" = 1 ] || [ "$hidden_dotdir_hit" = 1 ] || [ "$backdoor_user_hit" = 1 ]; then
     local check="cron-dropper"
-    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-watchdog"
-    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-loader-persistence"
-    [ "$hidden_dotfile_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-hidden-dotfile-exec"
-    [ "$backdoor_user_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && check="cron-backdoor-user-creation"
+    [ "$watchdog_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$hidden_dotdir_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-watchdog"
+    [ "$loader_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$hidden_dotdir_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-loader-persistence"
+    [ "$hidden_dotfile_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotdir_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-hidden-dotfile-exec"
+    [ "$hidden_dotdir_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$backdoor_user_hit" = 0 ] && check="cron-hidden-dotdir-exec"
+    [ "$backdoor_user_hit" = 1 ] && [ "$domain_hit" = 0 ] && [ "$watchdog_hit" = 0 ] && [ "$loader_hit" = 0 ] && [ "$hidden_dotfile_hit" = 0 ] && [ "$hidden_dotdir_hit" = 0 ] && check="cron-backdoor-user-creation"
     record "$check" "confirmed" "$label: $(echo "$content" | tr '\n' ';')"
     return 0
   fi
@@ -364,6 +399,11 @@ $decoded"
   # check_cron_content but then silently KEEP this exact line when rebuilding
   # the "cleaned" file line-by-line.
   is_hidden_dotfile_exec "$combined" && return 0
+  # Kept in sync with cron-hidden-dotdir-exec in check_cron_content above,
+  # same reason: without it, a surgical --kill rebuild would keep this exact
+  # line ("* * * * * root /bin/sh /var/tmp/.system/wd.sh"-shaped) as
+  # legitimate, letting it re-drop the whole campaign right after cleanup.
+  is_hidden_dotdir_exec "$combined" && return 0
   # Kept in sync with the cron-backdoor-user-creation signature in
   # check_cron_content above, same reason as the other three: without it, a
   # surgical --kill rebuild would correctly flag the whole crontab CONFIRMED
